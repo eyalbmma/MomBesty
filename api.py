@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
+APP_VERSION = "render-test-1"
 DB_PATH = "rag.db"
 TABLE = "rag1"
 EMB_COL = "embedding"
