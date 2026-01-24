@@ -1,4 +1,4 @@
-```python
+
 import os, json, sqlite3, time, hashlib, re
 import numpy as np
 from fastapi import FastAPI, Response
@@ -274,4 +274,3 @@ def ask_final(req: AskReq):
             for score, rid, _, _, _, tags in top
         ],
     }
-```
