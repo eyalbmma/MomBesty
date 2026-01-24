@@ -1,6 +1,6 @@
 import os, json, sqlite3, time, hashlib, re
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -28,14 +28,23 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "https://tranquil-gumdrop-998ac3.netlify.app",  # הדומיין שלך בנטליפיי
-        # אם יש לך עוד דומיין/Custom domain, תוסיף אותו פה
+        "https://tranquil-gumdrop-998ac3.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 # -----------------------------------------------------------
+
+# --- חשוב: Preflight OPTIONS כדי שלא נקבל 405 ---
+@app.options("/ask_final")
+def options_ask_final():
+    return Response(status_code=200)
+
+@app.options("/ask")
+def options_ask():
+    return Response(status_code=200)
+# ------------------------------------------------
 
 class AskReq(BaseModel):
     question: str
@@ -196,7 +205,7 @@ def ask_final(req: AskReq):
         return {
             "answer": cached,
             "cached": True,
-            "used_gpt": False,  # לא קראנו ל-GPT עכשיו
+            "used_gpt": False,
             "top_matches": [
                 {"score": round(score, 4), "id": rid, "tags": tags}
                 for score, rid, _, _, _, tags in top
