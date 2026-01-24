@@ -1,3 +1,4 @@
+```python
 import os, json, sqlite3, time, hashlib, re
 import numpy as np
 from fastapi import FastAPI, Response
@@ -29,6 +30,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "https://tranquil-gumdrop-998ac3.netlify.app",
+        "https://harmonious-scone-ad9f51.netlify.app",  # הכתובת החדשה שנטליפיי יצר
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -272,3 +274,4 @@ def ask_final(req: AskReq):
             for score, rid, _, _, _, tags in top
         ],
     }
+```
