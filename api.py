@@ -1,6 +1,7 @@
 import os, json, sqlite3, time, hashlib, re
 import numpy as np
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
@@ -19,11 +20,27 @@ PROMPT_VER = "v1"            # להעלות ל-v2 אם משנים פרומפט �
 # ----------------------
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 app = FastAPI()
+
+# --- CORS: מאפשר ל-React (localhost) + Netlify לקרוא לשרת ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://tranquil-gumdrop-998ac3.netlify.app",  # הדומיין שלך בנטליפיי
+        # אם יש לך עוד דומיין/Custom domain, תוסיף אותו פה
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# -----------------------------------------------------------
 
 class AskReq(BaseModel):
     question: str
     k: int = 3
+
 
 def get_embedding(text: str) -> np.ndarray:
     resp = client.embeddings.create(
@@ -32,9 +49,11 @@ def get_embedding(text: str) -> np.ndarray:
     )
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
+
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
     return float(np.dot(a, b) / denom)
+
 
 def fetch_all_rows():
     con = sqlite3.connect(DB_PATH)
@@ -46,6 +65,7 @@ def fetch_all_rows():
     rows = cur.fetchall()
     con.close()
     return rows
+
 
 # ---------- CACHE (SQLite) ----------
 def ensure_cache_table():
@@ -61,15 +81,18 @@ def ensure_cache_table():
     con.commit()
     con.close()
 
+
 def norm_q(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)  # מוריד פיסוק/סימנים
     return s
 
+
 def make_cache_key(question: str, top_ids: list[int], k: int) -> str:
     base = f"{PROMPT_VER}|{CHAT_MODEL}|k={k}|{norm_q(question)}|ids={','.join(map(str, top_ids))}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
 
 def cache_get(key: str):
     con = sqlite3.connect(DB_PATH)
@@ -84,6 +107,7 @@ def cache_get(key: str):
         return None
     return ans
 
+
 def cache_set(key: str, answer: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -94,8 +118,10 @@ def cache_set(key: str, answer: str):
     con.commit()
     con.close()
 
+
 ensure_cache_table()
 # -----------------------------------
+
 
 @app.get("/health")
 def health():
@@ -107,6 +133,7 @@ def health():
         "chat_model": CHAT_MODEL,
         "embed_model": EMBED_MODEL,
     }
+
 
 # Debug endpoint: מחזיר התאמות
 @app.post("/ask")
@@ -135,6 +162,7 @@ def ask(req: AskReq):
             for score, rid, qq, aa, source, tags in top
         ]
     }
+
 
 # MVP endpoint: תשובה אחת לאמא + cache + (אופציונלי) בלי GPT לפי score כשלא בפיילוט
 @app.post("/ask_final")
@@ -177,7 +205,6 @@ def ask_final(req: AskReq):
 
     # 2) אם לא בפיילוט, אפשר להחזיר תשובת DB בלי GPT לפי score
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
-        # מחזירים את התשובה של ה-best match ישירות
         _, rid, qq, aa, source, tags = top[0]
         return {
             "answer": aa,
@@ -189,7 +216,7 @@ def ask_final(req: AskReq):
             ],
         }
 
-    # 3) אחרת: קוראים ל-GPT (בפיילוט תמיד יגיע לכאן אם אין cache)
+    # 3) אחרת: קוראים ל-GPT
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
