@@ -1,4 +1,3 @@
-
 import os, json, sqlite3, time, hashlib, re
 import numpy as np
 from fastapi import FastAPI, Response
@@ -54,7 +53,29 @@ class AskReq(BaseModel):
     k: int = 3
 
 
+# =========================
+# Timing utilities (הערה שלי)
+# =========================
+def now_ms() -> int:
+    # perf_counter יציב למדידות זמן קצרות (טוב לפרופיילינג)
+    return int(time.perf_counter() * 1000)
+
+class Timer:
+    def __init__(self):
+        self.t0 = now_ms()
+        self.marks = {}
+
+    def mark(self, name: str):
+        self.marks[name] = now_ms() - self.t0
+
+    def snapshot(self):
+        out = dict(self.marks)
+        out["total_ms"] = now_ms() - self.t0
+        return out
+
+
 def get_embedding(text: str) -> np.ndarray:
+    # הערה: פה יש latency רשת + זמן מודל embedding
     resp = client.embeddings.create(
         model=EMBED_MODEL,
         input=[text.replace("\n", " ").strip()]
@@ -68,6 +89,7 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def fetch_all_rows():
+    # הערה: כרגע אתה קורא את כל הטבלה בכל בקשה (איטי)
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -139,6 +161,7 @@ ensure_cache_table()
 def health():
     return {
         "ok": True,
+        "version": APP_VERSION,
         "table": TABLE,
         "pilot_mode": PILOT_MODE,
         "top_score_threshold": TOP_SCORE_THRESHOLD,
@@ -150,8 +173,13 @@ def health():
 # Debug endpoint: מחזיר התאמות
 @app.post("/ask")
 def ask(req: AskReq):
+    t = Timer()
+
     qv = get_embedding(req.question)
+    t.mark("embed_ms")
+
     rows = fetch_all_rows()
+    t.mark("fetch_rows_ms")
 
     scored = []
     for rid, q, a, source, tags, emb_json in rows:
@@ -160,6 +188,10 @@ def ask(req: AskReq):
 
     scored.sort(reverse=True, key=lambda x: x[0])
     top = scored[:req.k]
+    t.mark("retrieve_ms")
+
+    # לוגים ל-Render
+    print("TIMING /ask:", t.snapshot(), "rows:", len(rows))
 
     return {
         "matches": [
@@ -172,16 +204,25 @@ def ask(req: AskReq):
                 "tags": tags,
             }
             for score, rid, qq, aa, source, tags in top
-        ]
+        ],
+        "timing": t.snapshot(),
     }
 
 
 # MVP endpoint: תשובה אחת לאמא + cache + (אופציונלי) בלי GPT לפי score כשלא בפיילוט
 @app.post("/ask_final")
 def ask_final(req: AskReq):
-    qv = get_embedding(req.question)
-    rows = fetch_all_rows()
+    t = Timer()
 
+    # 1) Embedding
+    qv = get_embedding(req.question)
+    t.mark("embed_ms")
+
+    # 2) DB fetch (כרגע: full scan)
+    rows = fetch_all_rows()
+    t.mark("fetch_rows_ms")
+
+    # 3) Retrieval compute (כרגע: json.loads + cosine בלולאה)
     scored = []
     for rid, q, a, source, tags, emb_json in rows:
         ev = np.array(json.loads(emb_json), dtype=np.float32)
@@ -189,52 +230,64 @@ def ask_final(req: AskReq):
 
     scored.sort(reverse=True, key=lambda x: x[0])
     top = scored[:req.k]
+    t.mark("retrieve_ms")
 
     if not top:
+        print("TIMING /ask_final (no top):", t.snapshot(), "rows:", len(rows))
         return {
             "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. תוכלי לנסח מחדש או להוסיף פרט אחד קטן?",
             "cached": False,
             "used_gpt": False,
             "top_matches": [],
+            "timing": t.snapshot(),
         }
 
     top_score = float(top[0][0])
     top_ids = [rid for _, rid, *_ in top]
     ck = make_cache_key(req.question, top_ids, req.k)
 
-    # 1) Cache hit
+    # 4) Cache get
     cached = cache_get(ck)
+    t.mark("cache_get_ms")
+
     if cached:
+        print("TIMING /ask_final (cache hit):", t.snapshot(), "top_score:", round(top_score, 4))
         return {
             "answer": cached,
             "cached": True,
             "used_gpt": False,
+            "top_score": round(top_score, 4),
             "top_matches": [
                 {"score": round(score, 4), "id": rid, "tags": tags}
                 for score, rid, _, _, _, tags in top
             ],
+            "timing": t.snapshot(),
         }
 
-    # 2) אם לא בפיילוט, אפשר להחזיר תשובת DB בלי GPT לפי score
+    # 5) אם לא בפיילוט, אפשר להחזיר תשובת DB בלי GPT לפי score
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
         _, rid, qq, aa, source, tags = top[0]
+        print("TIMING /ask_final (db only):", t.snapshot(), "top_score:", round(top_score, 4))
         return {
             "answer": aa,
             "cached": False,
             "used_gpt": False,
+            "top_score": round(top_score, 4),
             "top_matches": [
                 {"score": round(score, 4), "id": rid, "tags": tags}
                 for score, rid, _, _, _, tags in top
             ],
+            "timing": t.snapshot(),
         }
 
-    # 3) אחרת: קוראים ל-GPT
+    # 6) Build context for GPT
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
             for i, (score, _, qq, aa, _, tags) in enumerate(top)
         ]
     )
+    t.mark("build_context_ms")
 
     system = (
         "את עוזרת דיגיטלית רגועה ולא שיפוטית לאימהות אחרי לידה. "
@@ -251,6 +304,7 @@ def ask_final(req: AskReq):
         f"השתמשי רק במידע הבא (אל תוסיפי ידע מבחוץ):\n{context}"
     )
 
+    # 7) GPT call (בדרך כלל זה החלק הכי יקר בזמן)
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -259,11 +313,16 @@ def ask_final(req: AskReq):
         ],
         temperature=0.3,
     )
+    t.mark("gpt_ms")
 
     final_answer = resp.choices[0].message.content
 
-    # שומרים לקאש כדי שלא נשלם פעם נוספת על אותה תוצאה
+    # 8) Cache set
     cache_set(ck, final_answer)
+    t.mark("cache_set_ms")
+
+    # לוגים ל-Render
+    print("TIMING /ask_final (gpt):", t.snapshot(), "top_score:", round(top_score, 4))
 
     return {
         "answer": final_answer,
@@ -274,4 +333,5 @@ def ask_final(req: AskReq):
             {"score": round(score, 4), "id": rid, "tags": tags}
             for score, rid, _, _, _, tags in top
         ],
+        "timing": t.snapshot(),
     }
