@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-1"
+APP_VERSION = "render-test-2"  # עדכן כדי לוודא ש-Render עלה עם הגרסה החדשה
+
 DB_PATH = "rag.db"
 TABLE = "rag1"
 EMB_COL = "embedding"
@@ -30,7 +31,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "https://tranquil-gumdrop-998ac3.netlify.app",
-        "https://harmonious-scone-ad9f51.netlify.app",  # הכתובת החדשה שנטליפיי יצר
+        "https://harmonious-scone-ad9f51.netlify.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -54,10 +55,9 @@ class AskReq(BaseModel):
 
 
 # =========================
-# Timing utilities (הערה שלי)
+# Timing utilities
 # =========================
 def now_ms() -> int:
-    # perf_counter יציב למדידות זמן קצרות (טוב לפרופיילינג)
     return int(time.perf_counter() * 1000)
 
 class Timer:
@@ -75,7 +75,6 @@ class Timer:
 
 
 def get_embedding(text: str) -> np.ndarray:
-    # הערה: פה יש latency רשת + זמן מודל embedding
     resp = client.embeddings.create(
         model=EMBED_MODEL,
         input=[text.replace("\n", " ").strip()]
@@ -83,13 +82,20 @@ def get_embedding(text: str) -> np.ndarray:
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
+# ============================================================
+# RAG in-memory cache (שלב 1 לשיפור מהירות: טוענים פעם אחת)
+# ============================================================
+RAG_ROWS: list[tuple[int, str, str, str, str]] = []  # (id, q, a, source, tags)
+RAG_EMBS: np.ndarray | None = None                   # shape: (N, D)
+RAG_EMB_NORMS: np.ndarray | None = None              # shape: (N,)
 
+def load_rag_to_memory():
+    """
+    טוען פעם אחת את כל הרשומות עם embeddings מה-SQLite לזיכרון.
+    זה חוסך: SELECT + json.loads + לולאה על כל השורות בכל request.
+    """
+    global RAG_ROWS, RAG_EMBS, RAG_EMB_NORMS
 
-def fetch_all_rows():
-    # הערה: כרגע אתה קורא את כל הטבלה בכל בקשה (איטי)
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -98,7 +104,55 @@ def fetch_all_rows():
     )
     rows = cur.fetchall()
     con.close()
-    return rows
+
+    local_rows = []
+    embs = []
+
+    for rid, q, a, source, tags, emb_json in rows:
+        try:
+            ev = np.array(json.loads(emb_json), dtype=np.float32)
+        except Exception:
+            continue
+        if ev.size == 0:
+            continue
+        embs.append(ev)
+        local_rows.append((rid, q, a, source, tags))
+
+    if not embs:
+        RAG_ROWS = []
+        RAG_EMBS = None
+        RAG_EMB_NORMS = None
+        return
+
+    RAG_ROWS = local_rows
+    RAG_EMBS = np.vstack(embs).astype(np.float32)
+    RAG_EMB_NORMS = np.linalg.norm(RAG_EMBS, axis=1).astype(np.float32)
+
+def retrieve_top_k(qv: np.ndarray, k: int):
+    """
+    מחזיר top-k בהתבסס על cosine similarity, וקטורית ומהירה.
+    פלט: list[(score, rid, q, a, source, tags)]
+    """
+    if RAG_EMBS is None or RAG_EMB_NORMS is None or len(RAG_ROWS) == 0:
+        return []
+
+    q_norm = float(np.linalg.norm(qv)) + 1e-12
+    denom = (RAG_EMB_NORMS * q_norm) + 1e-12
+
+    # cosine = dot / (||A|| * ||q||)
+    dots = RAG_EMBS @ qv
+    scores = dots / denom
+
+    # top-k indices (מהיר יותר ממיון מלא)
+    k = max(1, min(int(k), scores.shape[0]))
+    idx = np.argpartition(scores, -k)[-k:]
+    idx = idx[np.argsort(scores[idx])[::-1]]
+
+    top = []
+    for i in idx:
+        rid, qq, aa, source, tags = RAG_ROWS[int(i)]
+        top.append((float(scores[int(i)]), rid, qq, aa, source, tags))
+    return top
 
 
 # ---------- CACHE (SQLite) ----------
@@ -115,18 +169,15 @@ def ensure_cache_table():
     con.commit()
     con.close()
 
-
 def norm_q(s: str) -> str:
     s = s.lower().strip()
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)  # מוריד פיסוק/סימנים
+    s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)
     return s
-
 
 def make_cache_key(question: str, top_ids: list[int], k: int) -> str:
     base = f"{PROMPT_VER}|{CHAT_MODEL}|k={k}|{norm_q(question)}|ids={','.join(map(str, top_ids))}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
-
 
 def cache_get(key: str):
     con = sqlite3.connect(DB_PATH)
@@ -141,7 +192,6 @@ def cache_get(key: str):
         return None
     return ans
 
-
 def cache_set(key: str, answer: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -152,10 +202,14 @@ def cache_set(key: str, answer: str):
     con.commit()
     con.close()
 
-
 ensure_cache_table()
+load_rag_to_memory()
 # -----------------------------------
 
+
+@app.get("/")
+def root():
+    return {"ok": True, "version": APP_VERSION}
 
 @app.get("/health")
 def health():
@@ -167,6 +221,7 @@ def health():
         "top_score_threshold": TOP_SCORE_THRESHOLD,
         "chat_model": CHAT_MODEL,
         "embed_model": EMBED_MODEL,
+        "rag_rows_loaded": len(RAG_ROWS),
     }
 
 
@@ -178,20 +233,10 @@ def ask(req: AskReq):
     qv = get_embedding(req.question)
     t.mark("embed_ms")
 
-    rows = fetch_all_rows()
-    t.mark("fetch_rows_ms")
-
-    scored = []
-    for rid, q, a, source, tags, emb_json in rows:
-        ev = np.array(json.loads(emb_json), dtype=np.float32)
-        scored.append((cosine(qv, ev), rid, q, a, source, tags))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    top = scored[:req.k]
+    top = retrieve_top_k(qv, req.k)
     t.mark("retrieve_ms")
 
-    # לוגים ל-Render
-    print("TIMING /ask:", t.snapshot(), "rows:", len(rows))
+    print("TIMING /ask:", t.snapshot(), "rows_loaded:", len(RAG_ROWS))
 
     return {
         "matches": [
@@ -218,22 +263,12 @@ def ask_final(req: AskReq):
     qv = get_embedding(req.question)
     t.mark("embed_ms")
 
-    # 2) DB fetch (כרגע: full scan)
-    rows = fetch_all_rows()
-    t.mark("fetch_rows_ms")
-
-    # 3) Retrieval compute (כרגע: json.loads + cosine בלולאה)
-    scored = []
-    for rid, q, a, source, tags, emb_json in rows:
-        ev = np.array(json.loads(emb_json), dtype=np.float32)
-        scored.append((cosine(qv, ev), rid, q, a, source, tags))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    top = scored[:req.k]
+    # 2) Retrieval (מהיר, בזיכרון)
+    top = retrieve_top_k(qv, req.k)
     t.mark("retrieve_ms")
 
     if not top:
-        print("TIMING /ask_final (no top):", t.snapshot(), "rows:", len(rows))
+        print("TIMING /ask_final (no top):", t.snapshot(), "rows_loaded:", len(RAG_ROWS))
         return {
             "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. תוכלי לנסח מחדש או להוסיף פרט אחד קטן?",
             "cached": False,
@@ -246,7 +281,7 @@ def ask_final(req: AskReq):
     top_ids = [rid for _, rid, *_ in top]
     ck = make_cache_key(req.question, top_ids, req.k)
 
-    # 4) Cache get
+    # 3) Cache get
     cached = cache_get(ck)
     t.mark("cache_get_ms")
 
@@ -264,7 +299,7 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # 5) אם לא בפיילוט, אפשר להחזיר תשובת DB בלי GPT לפי score
+    # 4) אם לא בפיילוט, אפשר להחזיר תשובת DB בלי GPT לפי score
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
         _, rid, qq, aa, source, tags = top[0]
         print("TIMING /ask_final (db only):", t.snapshot(), "top_score:", round(top_score, 4))
@@ -280,7 +315,7 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # 6) Build context for GPT
+    # 5) Build context for GPT
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
@@ -304,7 +339,7 @@ def ask_final(req: AskReq):
         f"השתמשי רק במידע הבא (אל תוסיפי ידע מבחוץ):\n{context}"
     )
 
-    # 7) GPT call (בדרך כלל זה החלק הכי יקר בזמן)
+    # 6) GPT call
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -317,11 +352,10 @@ def ask_final(req: AskReq):
 
     final_answer = resp.choices[0].message.content
 
-    # 8) Cache set
+    # 7) Cache set
     cache_set(ck, final_answer)
     t.mark("cache_set_ms")
 
-    # לוגים ל-Render
     print("TIMING /ask_final (gpt):", t.snapshot(), "top_score:", round(top_score, 4))
 
     return {
