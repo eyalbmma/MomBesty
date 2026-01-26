@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
-rag.db
+
+llli_dump.jsonl
+llli_dump_clean.jsonl
+rag1jsonresult.json
+
 .env
