@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-2"  # עדכן כדי לוודא ש-Render עלה עם הגרסה החדשה
+APP_VERSION = "render-test-3"  # עדכן כדי לוודא ש-Render עלה עם הגרסה החדשה
 
 DB_PATH = "rag.db"
 TABLE = "rag1"
@@ -83,18 +83,18 @@ def get_embedding(text: str) -> np.ndarray:
 
 
 # ============================================================
-# RAG in-memory cache (שלב 1 לשיפור מהירות: טוענים פעם אחת)
+# RAG in-memory cache (טעינה פעם אחת) + NORMALIZATION מראש
 # ============================================================
 RAG_ROWS: list[tuple[int, str, str, str, str]] = []  # (id, q, a, source, tags)
-RAG_EMBS: np.ndarray | None = None                   # shape: (N, D)
-RAG_EMB_NORMS: np.ndarray | None = None              # shape: (N,)
+RAG_EMBS: np.ndarray | None = None                   # shape: (N, D) normalized
+RAG_READY: bool = False
 
 def load_rag_to_memory():
     """
-    טוען פעם אחת את כל הרשומות עם embeddings מה-SQLite לזיכרון.
-    זה חוסך: SELECT + json.loads + לולאה על כל השורות בכל request.
+    טוען פעם אחת את כל הרשומות עם embeddings מה-SQLite לזיכרון,
+    ומנרמל מראש את embeddings (כדי שבבקשה רק נעשה dot product).
     """
-    global RAG_ROWS, RAG_EMBS, RAG_EMB_NORMS
+    global RAG_ROWS, RAG_EMBS, RAG_READY
 
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -121,30 +121,37 @@ def load_rag_to_memory():
     if not embs:
         RAG_ROWS = []
         RAG_EMBS = None
-        RAG_EMB_NORMS = None
+        RAG_READY = False
         return
 
+    embs_mat = np.vstack(embs).astype(np.float32)
+
+    # ✅ normalize embeddings once (N, D)
+    norms = np.linalg.norm(embs_mat, axis=1, keepdims=True) + 1e-12
+    embs_mat = (embs_mat / norms).astype(np.float32)
+
     RAG_ROWS = local_rows
-    RAG_EMBS = np.vstack(embs).astype(np.float32)
-    RAG_EMB_NORMS = np.linalg.norm(RAG_EMBS, axis=1).astype(np.float32)
+    RAG_EMBS = embs_mat
+    RAG_READY = True
 
 def retrieve_top_k(qv: np.ndarray, k: int):
     """
-    מחזיר top-k בהתבסס על cosine similarity, וקטורית ומהירה.
+    cosine similarity כששני הצדדים מנורמלים = dot product.
     פלט: list[(score, rid, q, a, source, tags)]
     """
-    if RAG_EMBS is None or RAG_EMB_NORMS is None or len(RAG_ROWS) == 0:
+    if (not RAG_READY) or (RAG_EMBS is None) or (len(RAG_ROWS) == 0):
         return []
 
-    q_norm = float(np.linalg.norm(qv)) + 1e-12
-    denom = (RAG_EMB_NORMS * q_norm) + 1e-12
+    # ✅ normalize query once
+    qv = qv.astype(np.float32)
+    qv = qv / (np.linalg.norm(qv) + 1e-12)
 
-    # cosine = dot / (||A|| * ||q||)
-    dots = RAG_EMBS @ qv
-    scores = dots / denom
+    # scores: (N,)
+    scores = RAG_EMBS @ qv
 
-    # top-k indices (מהיר יותר ממיון מלא)
     k = max(1, min(int(k), scores.shape[0]))
+
+    # top-k indices without sorting full array
     idx = np.argpartition(scores, -k)[-k:]
     idx = idx[np.argsort(scores[idx])[::-1]]
 
@@ -222,6 +229,7 @@ def health():
         "chat_model": CHAT_MODEL,
         "embed_model": EMBED_MODEL,
         "rag_rows_loaded": len(RAG_ROWS),
+        "rag_ready": RAG_READY,
     }
 
 
@@ -263,7 +271,7 @@ def ask_final(req: AskReq):
     qv = get_embedding(req.question)
     t.mark("embed_ms")
 
-    # 2) Retrieval (מהיר, בזיכרון)
+    # 2) Retrieval (מהיר, בזיכרון + normalized)
     top = retrieve_top_k(qv, req.k)
     t.mark("retrieve_ms")
 
