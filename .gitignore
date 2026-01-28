@@ -1,8 +1,25 @@
+# Python
 __pycache__/
 *.pyc
 
-llli_dump.jsonl
-llli_dump_clean.jsonl
-rag1jsonresult.json
+# SQLite – allow rag.db, ignore the rest
+*.db
+!rag.db
 
-.env
+# SQLite temp files
+*.db-wal
+*.db-shm
+
+# Data / exports
+*.csv
+*.json
+*.txt
+
+# One-off scripts (אם לא רוצים לעלות)
+scrape_*.py
+generate_*.py
+*_dump.py
+backup*.db
+
+# OS
+.DS_Store
