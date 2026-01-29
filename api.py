@@ -82,6 +82,10 @@ class AskReq(BaseModel):
     conversation_id: Optional[str] = None
 
 
+
+
+
+
 # =========================
 # Timing utilities
 # =========================
@@ -116,17 +120,23 @@ def norm_q(s: str) -> str:
 # Ensure rag.db exists (download from Drive if missing)
 # =========================
 def ensure_rag_db():
-    # אם הקובץ קיים וגדול מספיק - לא מורידים שוב
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 10_000_000:
         print("rag.db already exists, skipping download")
         return
 
-    if not RAG_DB_URL:
-        raise RuntimeError("Missing RAG_DB_URL env var")
+    file_id = os.getenv("RAG_DB_FILE_ID", "").strip()
+    if not file_id:
+        raise RuntimeError("Missing RAG_DB_FILE_ID env var")
 
-    print("Downloading rag.db from RAG_DB_URL ...")
-    urllib.request.urlretrieve(RAG_DB_URL, DB_PATH)
+    print("Downloading rag.db from Google Drive via gdown...")
+    import gdown
+    url = f"https://drive.google.com/uc?id={file_id}"
+    gdown.download(url, DB_PATH, quiet=False)
+
     print("Downloaded rag.db size:", os.path.getsize(DB_PATH))
+
+
+
 
 
 # =========================
