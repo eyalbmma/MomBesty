@@ -2,13 +2,11 @@
 __pycache__/
 *.pyc
 
-# SQLite – allow rag.db, ignore the rest
+# SQLite – ignore all databases
 *.db
-!rag.db
-
-# SQLite temp files
 *.db-wal
 *.db-shm
+
 
 # Data / exports
 *.csv

@@ -4,6 +4,7 @@ import sqlite3
 import time
 import hashlib
 import re
+import urllib.request
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
@@ -16,7 +17,7 @@ from openai import OpenAI
 # =========================
 # Config
 # =========================
-APP_VERSION = "render-test-6-chat-memory"
+APP_VERSION = "render-test-7-drive-db"
 
 DB_PATH = "rag.db"
 TABLE = "rag_clean"
@@ -33,6 +34,9 @@ SOFT_CUTOFF = 0.58                 # ✅ בפיילוט: כן קוראים ל-GP
 CACHE_TTL_SECONDS = 7 * 24 * 3600
 PROMPT_VER = "v4-chat-memory"
 # ----------------------
+
+# ✅ Google Drive direct download link (set this in Render env vars)
+RAG_DB_URL = os.getenv("RAG_DB_URL", "").strip()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -52,7 +56,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 # --- OPTIONS Preflight ---
@@ -107,6 +110,23 @@ def norm_q(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)
     return s
+
+
+# =========================
+# Ensure rag.db exists (download from Drive if missing)
+# =========================
+def ensure_rag_db():
+    # אם הקובץ קיים וגדול מספיק - לא מורידים שוב
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 10_000_000:
+        print("rag.db already exists, skipping download")
+        return
+
+    if not RAG_DB_URL:
+        raise RuntimeError("Missing RAG_DB_URL env var")
+
+    print("Downloading rag.db from RAG_DB_URL ...")
+    urllib.request.urlretrieve(RAG_DB_URL, DB_PATH)
+    print("Downloaded rag.db size:", os.path.getsize(DB_PATH))
 
 
 # =========================
@@ -236,7 +256,6 @@ def make_cache_key(
     conversation_id: Optional[str],
     history: List[Tuple[str, str]],
 ) -> str:
-    # טביעת אצבע קצרה של ההיסטוריה כדי שה-cache לא יחזיר תשובה משיחה אחרת
     hist_compact = "|".join([f"{r}:{norm_q(c)[:80]}" for r, c in history[-10:]])
     base = (
         f"{PROMPT_VER}|{CHAT_MODEL}|k={k}"
@@ -396,8 +415,9 @@ def retrieve_top_k(qv: np.ndarray, k: int):
 
 
 # =========================
-# Init
+# Init (IMPORTANT ORDER)
 # =========================
+ensure_rag_db()
 ensure_tables()
 load_rag_to_memory()
 
@@ -430,7 +450,6 @@ def reload_rag():
     load_rag_to_memory()
     return {"ok": True, "rag_rows_loaded": len(RAG_ROWS), "rag_ready": RAG_READY}
 
-
 @app.post("/ask")
 def ask(req: AskReq):
     t = Timer()
@@ -456,7 +475,6 @@ def ask(req: AskReq):
         "timing": t.snapshot(),
     }
 
-
 @app.post("/ask_final")
 def ask_final(req: AskReq):
     t = Timer()
@@ -466,7 +484,7 @@ def ask_final(req: AskReq):
         upsert_conversation(req.user_id, req.conversation_id)
         add_message(req.conversation_id, "user", req.question)
 
-    # ✅ שליפת ההיסטוריה כדי שיהיה "זיכרון" (גם אחרי שבוע)
+    # שליפת היסטוריה
     history: List[Tuple[str, str]] = []
     if req.conversation_id:
         history = get_recent_messages(req.conversation_id, limit=12)
@@ -491,7 +509,7 @@ def ask_final(req: AskReq):
 
     top_score = float(top[0][0])
 
-    # ✅ Guardrail
+    # Guardrail
     if top_score < SOFT_CUTOFF:
         return {
             "answer": (
@@ -520,6 +538,7 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
+    # Cache key
     top_ids = [rid for _, rid, *_ in top]
     ck = make_cache_key(req.question, top_ids, req.k, req.conversation_id, history)
 
@@ -536,7 +555,7 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # 4) DB-only (רק אם לא בפיילוט)
+    # DB-only (רק אם לא בפיילוט)
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
         _, rid, qq, aa, source, tags = top[0]
         return {
@@ -548,7 +567,7 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # 5) Context for GPT (מהמאגר)
+    # Context for GPT
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
@@ -557,7 +576,6 @@ def ask_final(req: AskReq):
     )
     t.mark("build_context_ms")
 
-    # ✅ שיחת וואטסאפ: מוסיפים היסטוריה כטקסט קצר
     history_text = ""
     if history:
         lines = []
@@ -590,7 +608,6 @@ def ask_final(req: AskReq):
         "אם אין במידע מהמאגר בסיס לתשובה מדויקת — שאלי שאלה אחת קצרה כדי לדייק."
     )
 
-    # 6) GPT call
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
