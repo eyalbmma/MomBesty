@@ -4,7 +4,6 @@ import sqlite3
 import time
 import hashlib
 import re
-import urllib.request
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
@@ -13,11 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-
 # =========================
 # Config
 # =========================
-APP_VERSION = "render-test-7-drive-db"
+APP_VERSION = "render-test-8-topic-fallback"
 
 DB_PATH = "rag.db"
 TABLE = "rag_clean"
@@ -28,20 +26,19 @@ CHAT_MODEL = "gpt-4o-mini"
 
 # ---- MVP controls ----
 PILOT_MODE = True
+
 TOP_SCORE_THRESHOLD = 0.80
-LOW_SCORE_CUTOFF = 0.65            # מתחת לזה "בדרך כלל" לא קוראים ל-GPT
-SOFT_CUTOFF = 0.58                 # ✅ בפיילוט: כן קוראים ל-GPT גם בטווח 0.58–0.65
+LOW_SCORE_CUTOFF = 0.65
+
+# בפיילוט: אם יש התאמה בינונית – נפעיל GPT (והוא ישאל הבהרה חכמה אם צריך)
+SOFT_CUTOFF = 0.45
+
 CACHE_TTL_SECONDS = 7 * 24 * 3600
-PROMPT_VER = "v4-chat-memory"
+PROMPT_VER = "v5-chat-memory-topic-fallback"
 # ----------------------
 
-# ✅ Google Drive direct download link (set this in Render env vars)
-RAG_DB_URL = os.getenv("RAG_DB_URL", "").strip()
-
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 app = FastAPI()
-
 
 # =========================
 # CORS
@@ -49,16 +46,12 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https://.*\.netlify\.app$",
-    allow_origins=[
-        "http://localhost:5173",
-    ],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# --- OPTIONS Preflight ---
 @app.options("/ask_final")
 def options_ask_final():
     return Response(status_code=200)
@@ -71,7 +64,6 @@ def options_ask():
 def options_reload_rag():
     return Response(status_code=200)
 
-
 # =========================
 # Models
 # =========================
@@ -80,11 +72,6 @@ class AskReq(BaseModel):
     k: int = 3
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
-
-
-
-
-
 
 # =========================
 # Timing utilities
@@ -105,7 +92,6 @@ class Timer:
         out["total_ms"] = now_ms() - self.t0
         return out
 
-
 # =========================
 # Text normalization
 # =========================
@@ -115,6 +101,10 @@ def norm_q(s: str) -> str:
     s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)
     return s
 
+def tokenize_he(s: str) -> List[str]:
+    s = norm_q(s)
+    toks = [t for t in s.split(" ") if len(t) >= 3]
+    return toks
 
 # =========================
 # Ensure rag.db exists (download from Drive if missing)
@@ -135,15 +125,10 @@ def ensure_rag_db():
 
     print("Downloaded rag.db size:", os.path.getsize(DB_PATH))
 
-
-
-
-
 # =========================
 # SQLite helpers
 # =========================
 def db_connect():
-    # check_same_thread=False עוזר אם יש ריבוי threads בשרת
     return sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
 
 def column_exists(table: str, col: str) -> bool:
@@ -160,7 +145,6 @@ def ensure_tables():
     con = db_connect()
     cur = con.cursor()
 
-    # Cache לתשובות GPT
     cur.execute("""
         CREATE TABLE IF NOT EXISTS llm_cache (
             cache_key TEXT PRIMARY KEY,
@@ -169,7 +153,6 @@ def ensure_tables():
         );
     """)
 
-    # Cache ל-Embeddings
     cur.execute("""
         CREATE TABLE IF NOT EXISTS emb_cache (
             q_norm TEXT PRIMARY KEY,
@@ -178,7 +161,6 @@ def ensure_tables():
         );
     """)
 
-    # טבלאות שיחה
     cur.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -255,9 +237,8 @@ def get_recent_messages(conversation_id: str, limit: int = 12) -> List[Tuple[str
     rows = list(reversed(rows))
     return [(r or "", c or "") for (r, c) in rows]
 
-
 # =========================
-# LLM answer cache (includes conversation + history fingerprint)
+# LLM answer cache
 # =========================
 def make_cache_key(
     question: str,
@@ -298,7 +279,6 @@ def cache_set(key: str, answer: str):
     )
     con.commit()
     con.close()
-
 
 # =========================
 # Embedding cache
@@ -347,7 +327,6 @@ def get_embedding(text: str, timing: Optional[Timer] = None) -> np.ndarray:
         timing.mark("embed_cache_miss_ms")
     return v
 
-
 # =========================
 # RAG in-memory
 # =========================
@@ -356,9 +335,6 @@ RAG_EMBS: Optional[np.ndarray] = None
 RAG_READY: bool = False
 
 def load_rag_to_memory():
-    """
-    ✅ לא נשבר אם אין is_active.
-    """
     global RAG_ROWS, RAG_EMBS, RAG_READY
 
     has_is_active = column_exists(TABLE, "is_active")
@@ -404,7 +380,36 @@ def load_rag_to_memory():
     RAG_EMBS = embs_mat
     RAG_READY = True
 
-def retrieve_top_k(qv: np.ndarray, k: int):
+def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> float:
+    """
+    בוסט קטן אם יש חפיפה חזקה במילות מפתח/תת־מחרוזת.
+    זה מצמצם נפילות של שאלות קצרות ("תנוחות שונות") לציון נמוך מדי.
+    """
+    qn = norm_q(question)
+    cn = norm_q(candidate_q)
+
+    # התאמה כמעט ישירה
+    if qn and (qn in cn or cn in qn):
+        return 0.20
+
+    qt = set(tokenize_he(question))
+    ct = set(tokenize_he(candidate_q))
+    if not qt or not ct:
+        return 0.0
+
+    reflect = len(qt.intersection(ct)) / max(1, len(qt))
+    if reflect >= 0.6:
+        return 0.12
+    if reflect >= 0.4:
+        return 0.06
+
+    # בוסט לפי tags
+    if "breast" in (candidate_tags or "").lower() and ("הנקה" in qn or "שד" in qn):
+        return 0.06
+
+    return 0.0
+
+def retrieve_top_k(qv: np.ndarray, question: str, k: int):
     if (not RAG_READY) or (RAG_EMBS is None) or (len(RAG_ROWS) == 0):
         return []
 
@@ -420,17 +425,46 @@ def retrieve_top_k(qv: np.ndarray, k: int):
     top = []
     for i in idx:
         rid, qq, aa, source, tags = RAG_ROWS[int(i)]
-        top.append((float(scores[int(i)]), rid, qq, aa, source, tags))
+        base = float(scores[int(i)])
+        boosted = min(0.999, base + _keyword_boost(question, qq, tags))
+        top.append((boosted, rid, qq, aa, source, tags, base))
     return top
 
+# =========================
+# Topic-aware fallback
+# =========================
+def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
+    qn = norm_q(question)
+    tags_blob = " ".join([(m[5] or "") for m in top_matches]).lower()
+
+    # breastfeeding
+    if ("הנקה" in qn) or ("שד" in qn) or ("פטמה" in qn) or ("breast" in tags_blob) or ("breastfeeding" in tags_blob):
+        return (
+            "כדי לדייק לגבי תנוחות הנקה: בת כמה/בן כמה התינוק, "
+            "והאם יש כאב/סדקים או קושי בהיצמדות? (אפשר לענות במשפט אחד)"
+        )
+
+    # baby sleep/feeding
+    if ("שינה" in qn) or ("בכי" in qn) or ("אוכל" in qn) or ("האכלה" in qn):
+        return (
+            "כדי לדייק: בן כמה התינוק, ומה בדיוק קורה עכשיו (שינה/בכי/האכלה) ומה ניסית עד עכשיו?"
+        )
+
+    # postpartum physical
+    if ("דימום" in qn) or ("חום" in qn) or ("כאב" in qn) or ("תפרים" in qn):
+        return (
+            "כדי לדייק: יש חום/ריח חריג/כאב שמתגבר או דימום שמתחזק? ומה שבוע אחרי לידה את?"
+        )
+
+    # generic
+    return "כדי לענות מדויק, תוכלי לכתוב משפט אחד נוסף עם הקשר? (למשל: על מי זה, ומה בדיוק הקושי)"
 
 # =========================
-# Init (IMPORTANT ORDER)
+# Init
 # =========================
 ensure_rag_db()
 ensure_tables()
 load_rag_to_memory()
-
 
 # =========================
 # Endpoints
@@ -463,24 +497,24 @@ def reload_rag():
 @app.post("/ask")
 def ask(req: AskReq):
     t = Timer()
-
     qv = get_embedding(req.question, timing=t)
     t.mark("embed_ms")
 
-    top = retrieve_top_k(qv, req.k)
+    top = retrieve_top_k(qv, req.question, req.k)
     t.mark("retrieve_ms")
 
     return {
         "matches": [
             {
                 "score": round(score, 4),
+                "score_base": round(base, 4),
                 "id": rid,
                 "question": qq,
                 "answer": aa,
                 "source": source,
                 "tags": tags,
             }
-            for score, rid, qq, aa, source, tags in top
+            for (score, rid, qq, aa, source, tags, base) in top
         ],
         "timing": t.snapshot(),
     }
@@ -494,7 +528,6 @@ def ask_final(req: AskReq):
         upsert_conversation(req.user_id, req.conversation_id)
         add_message(req.conversation_id, "user", req.question)
 
-    # שליפת היסטוריה
     history: List[Tuple[str, str]] = []
     if req.conversation_id:
         history = get_recent_messages(req.conversation_id, limit=12)
@@ -505,7 +538,7 @@ def ask_final(req: AskReq):
     t.mark("embed_ms")
 
     # 2) Retrieval
-    top = retrieve_top_k(qv, req.k)
+    top = retrieve_top_k(qv, req.question, req.k)
     t.mark("retrieve_ms")
 
     if not top:
@@ -519,37 +552,31 @@ def ask_final(req: AskReq):
 
     top_score = float(top[0][0])
 
-    # Guardrail
+    # Guardrail (topic-aware)
+    # בפיילוט: רק אם ממש אין התאמה -> לא מפעילים GPT, ושואלים הבהרה מתאימה לנושא
     if top_score < SOFT_CUTOFF:
         return {
-            "answer": (
-                "אין לי מספיק התאמה מדויקת במאגר כדי לענות בביטחון. "
-                "שאלה קצרה כדי לדייק: מה הדבר שהכי מטריד אותך עכשיו — מצב רוח/חרדה ובכי, "
-                "עייפות וחוסר שינה, או משהו פיזי (כאב/דימום/חום)?"
-            ),
+            "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for s, rid, *_ , tags in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_rest, tags, base) in [(x[0], x[1], x[2], x[3], x[4], x[5], x[6]) for x in top]],
             "timing": t.snapshot(),
         }
 
+    # במצב לא-פיילוט: עדיין אפשר לחסום מתחת LOW_SCORE_CUTOFF
     if (not PILOT_MODE) and (top_score < LOW_SCORE_CUTOFF):
         return {
-            "answer": (
-                "אין לי מספיק מידע מדויק במאגר כדי לענות בצורה טובה. "
-                "שאלה קצרה כדי לדייק: מה הנושא העיקרי כאן — כאב/תסמין פיזי אצלך, "
-                "קושי רגשי/עייפות, או משהו שקשור לתינוק (שינה/האכלה/בכי)?"
-            ),
+            "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for s, rid, *_ , tags in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_rest, tags, base) in [(x[0], x[1], x[2], x[3], x[4], x[5], x[6]) for x in top]],
             "timing": t.snapshot(),
         }
 
     # Cache key
-    top_ids = [rid for _, rid, *_ in top]
+    top_ids = [rid for (_, rid, *_rest) in top]
     ck = make_cache_key(req.question, top_ids, req.k, req.conversation_id, history)
 
     cached = cache_get(ck)
@@ -561,19 +588,19 @@ def ask_final(req: AskReq):
             "cached": True,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for s, rid, *_ , tags in top],
+            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, _b) in top],
             "timing": t.snapshot(),
         }
 
     # DB-only (רק אם לא בפיילוט)
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
-        _, rid, qq, aa, source, tags = top[0]
+        _, rid, qq, aa, source, tags, base = top[0]
         return {
             "answer": aa,
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for s, rid, *_ , tags in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -581,7 +608,7 @@ def ask_final(req: AskReq):
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
-            for i, (score, _, qq, aa, _, tags) in enumerate(top)
+            for i, (score, _rid, qq, aa, _source, tags, _base) in enumerate(top)
         ]
     )
     t.mark("build_context_ms")
@@ -597,25 +624,24 @@ def ask_final(req: AskReq):
 
     system = (
         "את עוזרת דיגיטלית לאימהות אחרי לידה, בטון חם, מכיל, אמפתי ולא שיפוטי. "
-        "המטרה: לתת לאמא תחושת ביטחון, הבנה ועידוד — יחד עם מידע מדויק ורלוונטי.\n\n"
+        "המטרה: לתת תחושת ביטחון והכוונה.\n\n"
         "כללי חובה:\n"
         "• אל תאבחני ואל תקבעי 'יש לך X'.\n"
-        "• השתמשי רק במידע שניתן לך ב'מידע מהמאגר'. אם אין מספיק מידע — שאלי שאלה אחת קצרה במקום לנחש.\n"
-        "• קחי בחשבון את 'הקשר שיחה קודם' כדי לזכור פרטים שהאמא אמרה (אבל אל תמציאי פרטים).\n"
+        "• השתמשי קודם כל ב'מידע מהמאגר'. אם אין מספיק בסיס — שאלי שאלה אחת קצרה ורלוונטית לנושא.\n"
         "• כתבי בעברית פשוטה, קצרה וברורה.\n\n"
-        "מבנה קבוע לתשובה:\n"
-        "1) רגע איתך (2–3 משפטים)\n"
-        "2) מה אפשר לעשות עכשיו (3–5 נקודות)\n"
-        "3) מתי כדאי לפנות לעזרה (2–4 נקודות)\n"
-        "4) שאלה קצרה (רק אם חסר פרט קריטי)\n"
+        "מבנה מומלץ:\n"
+        "1) רגע איתך (1–2 משפטים)\n"
+        "2) תשובה / הסבר (קצר וברור)\n"
+        "3) מה אפשר לעשות עכשיו (3–5 נקודות)\n"
+        "4) מתי כדאי לפנות לעזרה (2–4 נקודות)\n"
+        "5) שאלה קצרה (רק אם חסר פרט קריטי)\n"
     )
 
     user = (
         f"שאלת האמא (עכשיו): {req.question}\n\n"
-        f"הקשר שיחה קודם (לזכור רצף/פרטים, בלי להמציא):\n"
-        f"{history_text or '(אין הקשר קודם)'}\n\n"
-        f"מידע מהמאגר (השתמשי רק בזה, אל תוסיפי ידע מבחוץ):\n{context}\n\n"
-        "אם אין במידע מהמאגר בסיס לתשובה מדויקת — שאלי שאלה אחת קצרה כדי לדייק."
+        f"הקשר שיחה קודם:\n{history_text or '(אין הקשר קודם)'}\n\n"
+        f"מידע מהמאגר:\n{context}\n\n"
+        "אם אין במידע מהמאגר בסיס לתשובה מדויקת — שאלי שאלה אחת קצרה כדי לדייק (רלוונטית לנושא שנשאל)."
     )
 
     resp = client.chat.completions.create(
@@ -641,6 +667,6 @@ def ask_final(req: AskReq):
         "cached": False,
         "used_gpt": True,
         "top_score": round(top_score, 4),
-        "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for s, rid, *_ , tags in top],
+        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, base) in top],
         "timing": t.snapshot(),
     }
