@@ -15,7 +15,7 @@ from openai import OpenAI
 # =========================
 # Config
 # =========================
-APP_VERSION = "render-test-8-topic-fallback"
+APP_VERSION = "render-test-9-fast"
 
 DB_PATH = "rag.db"
 TABLE = "rag_clean"
@@ -26,15 +26,20 @@ CHAT_MODEL = "gpt-4o-mini"
 
 # ---- MVP controls ----
 PILOT_MODE = True
-
 TOP_SCORE_THRESHOLD = 0.80
 LOW_SCORE_CUTOFF = 0.65
-
-# בפיילוט: אם יש התאמה בינונית – נפעיל GPT (והוא ישאל הבהרה חכמה אם צריך)
-SOFT_CUTOFF = 0.45
+SOFT_CUTOFF = 0.45  # בפיילוט: מפעילים GPT גם בהתאמה בינונית
 
 CACHE_TTL_SECONDS = 7 * 24 * 3600
-PROMPT_VER = "v5-chat-memory-topic-fallback"
+PROMPT_VER = "v6-fast-prompts"
+
+# ---- Speed controls ----
+HISTORY_LIMIT_DB = 6          # כמה הודעות לשלוף מה-DB
+HISTORY_LIMIT_TO_GPT = 4      # כמה להכניס באמת לפרומפט
+CLIP_Q_CHARS = 220            # קיצור שאלה מהמאגר
+CLIP_A_CHARS = 700            # קיצור תשובה מהמאגר
+MAX_TOKENS = 220              # מגביל אורך תשובת GPT (משפר זמן)
+TEMPERATURE = 0.3
 # ----------------------
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -103,8 +108,11 @@ def norm_q(s: str) -> str:
 
 def tokenize_he(s: str) -> List[str]:
     s = norm_q(s)
-    toks = [t for t in s.split(" ") if len(t) >= 3]
-    return toks
+    return [t for t in s.split(" ") if len(t) >= 3]
+
+def clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
 
 # =========================
 # Ensure rag.db exists (download from Drive if missing)
@@ -247,7 +255,7 @@ def make_cache_key(
     conversation_id: Optional[str],
     history: List[Tuple[str, str]],
 ) -> str:
-    hist_compact = "|".join([f"{r}:{norm_q(c)[:80]}" for r, c in history[-10:]])
+    hist_compact = "|".join([f"{r}:{norm_q(c)[:60]}" for r, c in history[-HISTORY_LIMIT_TO_GPT:]])
     base = (
         f"{PROMPT_VER}|{CHAT_MODEL}|k={k}"
         f"|conv={conversation_id or ''}"
@@ -374,21 +382,15 @@ def load_rag_to_memory():
 
     embs_mat = np.vstack(embs).astype(np.float32)
     norms = np.linalg.norm(embs_mat, axis=1, keepdims=True) + 1e-12
-    embs_mat = (embs_mat / norms).astype(np.float32)
+    RAG_EMBS = (embs_mat / norms).astype(np.float32)
 
     RAG_ROWS = local_rows
-    RAG_EMBS = embs_mat
     RAG_READY = True
 
 def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> float:
-    """
-    בוסט קטן אם יש חפיפה חזקה במילות מפתח/תת־מחרוזת.
-    זה מצמצם נפילות של שאלות קצרות ("תנוחות שונות") לציון נמוך מדי.
-    """
     qn = norm_q(question)
     cn = norm_q(candidate_q)
 
-    # התאמה כמעט ישירה
     if qn and (qn in cn or cn in qn):
         return 0.20
 
@@ -399,13 +401,12 @@ def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> floa
 
     reflect = len(qt.intersection(ct)) / max(1, len(qt))
     if reflect >= 0.6:
-        return 0.12
+        return 0.10
     if reflect >= 0.4:
-        return 0.06
+        return 0.05
 
-    # בוסט לפי tags
     if "breast" in (candidate_tags or "").lower() and ("הנקה" in qn or "שד" in qn):
-        return 0.06
+        return 0.05
 
     return 0.0
 
@@ -437,27 +438,16 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
     qn = norm_q(question)
     tags_blob = " ".join([(m[5] or "") for m in top_matches]).lower()
 
-    # breastfeeding
     if ("הנקה" in qn) or ("שד" in qn) or ("פטמה" in qn) or ("breast" in tags_blob) or ("breastfeeding" in tags_blob):
-        return (
-            "כדי לדייק לגבי תנוחות הנקה: בת כמה/בן כמה התינוק, "
-            "והאם יש כאב/סדקים או קושי בהיצמדות? (אפשר לענות במשפט אחד)"
-        )
+        return "כדי לדייק: בן/בת כמה התינוק, והאם יש כאב/סדקים או קושי בהיצמדות?"
 
-    # baby sleep/feeding
     if ("שינה" in qn) or ("בכי" in qn) or ("אוכל" in qn) or ("האכלה" in qn):
-        return (
-            "כדי לדייק: בן כמה התינוק, ומה בדיוק קורה עכשיו (שינה/בכי/האכלה) ומה ניסית עד עכשיו?"
-        )
+        return "כדי לדייק: בן/בת כמה התינוק, ומה בדיוק קורה עכשיו ומה ניסית?"
 
-    # postpartum physical
     if ("דימום" in qn) or ("חום" in qn) or ("כאב" in qn) or ("תפרים" in qn):
-        return (
-            "כדי לדייק: יש חום/ריח חריג/כאב שמתגבר או דימום שמתחזק? ומה שבוע אחרי לידה את?"
-        )
+        return "כדי לדייק: יש חום/דימום שמתחזק/כאב שמתגבר? ואיזה שבוע אחרי לידה את?"
 
-    # generic
-    return "כדי לענות מדויק, תוכלי לכתוב משפט אחד נוסף עם הקשר? (למשל: על מי זה, ומה בדיוק הקושי)"
+    return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
 
 # =========================
 # Init
@@ -523,14 +513,14 @@ def ask(req: AskReq):
 def ask_final(req: AskReq):
     t = Timer()
 
-    # 0) שימור קונטקסט שיחה
+    # 0) שימור שיחה
     if req.user_id and req.conversation_id:
         upsert_conversation(req.user_id, req.conversation_id)
         add_message(req.conversation_id, "user", req.question)
 
     history: List[Tuple[str, str]] = []
     if req.conversation_id:
-        history = get_recent_messages(req.conversation_id, limit=12)
+        history = get_recent_messages(req.conversation_id, limit=HISTORY_LIMIT_DB)
         t.mark("history_ms")
 
     # 1) Embedding
@@ -543,7 +533,7 @@ def ask_final(req: AskReq):
 
     if not top:
         return {
-            "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. תוכלי לנסח מחדש או להוסיף פרט אחד קטן?",
+            "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?",
             "cached": False,
             "used_gpt": False,
             "top_matches": [],
@@ -552,31 +542,29 @@ def ask_final(req: AskReq):
 
     top_score = float(top[0][0])
 
-    # Guardrail (topic-aware)
-    # בפיילוט: רק אם ממש אין התאמה -> לא מפעילים GPT, ושואלים הבהרה מתאימה לנושא
+    # Guardrail
     if top_score < SOFT_CUTOFF:
         return {
             "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_rest, tags, base) in [(x[0], x[1], x[2], x[3], x[4], x[5], x[6]) for x in top]],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
-    # במצב לא-פיילוט: עדיין אפשר לחסום מתחת LOW_SCORE_CUTOFF
     if (not PILOT_MODE) and (top_score < LOW_SCORE_CUTOFF):
         return {
             "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_rest, tags, base) in [(x[0], x[1], x[2], x[3], x[4], x[5], x[6]) for x in top]],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
     # Cache key
-    top_ids = [rid for (_, rid, *_rest) in top]
+    top_ids = [rid for (_, rid, *_r) in top]
     ck = make_cache_key(req.question, top_ids, req.k, req.conversation_id, history)
 
     cached = cache_get(ck)
@@ -588,7 +576,7 @@ def ask_final(req: AskReq):
             "cached": True,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, _b) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -600,48 +588,43 @@ def ask_final(req: AskReq):
             "cached": False,
             "used_gpt": False,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, base) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
-    # Context for GPT
+    # Build context (CLIPPED)
     context = "\n\n".join(
         [
-            f"ידע {i+1} (score={score:.3f}, tags={tags}):\nשאלה: {qq}\nתשובה: {aa}"
+            f"ידע {i+1} (score={score:.3f}, tags={tags}):\n"
+            f"שאלה: {clip(qq, CLIP_Q_CHARS)}\n"
+            f"תשובה: {clip(aa, CLIP_A_CHARS)}"
             for i, (score, _rid, qq, aa, _source, tags, _base) in enumerate(top)
         ]
     )
     t.mark("build_context_ms")
 
+    # History (SHORT)
     history_text = ""
     if history:
         lines = []
-        for role, content in history[-10:]:
+        for role, content in history[-HISTORY_LIMIT_TO_GPT:]:
             role_h = "אמא" if role == "user" else "עוזרת"
-            lines.append(f"{role_h}: {content}")
+            lines.append(f"{role_h}: {clip(content, 220)}")
         history_text = "\n".join(lines)
     t.mark("build_history_ms")
 
+    # SHORT prompts
     system = (
-        "את עוזרת דיגיטלית לאימהות אחרי לידה, בטון חם, מכיל, אמפתי ולא שיפוטי. "
-        "המטרה: לתת תחושת ביטחון והכוונה.\n\n"
-        "כללי חובה:\n"
-        "• אל תאבחני ואל תקבעי 'יש לך X'.\n"
-        "• השתמשי קודם כל ב'מידע מהמאגר'. אם אין מספיק בסיס — שאלי שאלה אחת קצרה ורלוונטית לנושא.\n"
-        "• כתבי בעברית פשוטה, קצרה וברורה.\n\n"
-        "מבנה מומלץ:\n"
-        "1) רגע איתך (1–2 משפטים)\n"
-        "2) תשובה / הסבר (קצר וברור)\n"
-        "3) מה אפשר לעשות עכשיו (3–5 נקודות)\n"
-        "4) מתי כדאי לפנות לעזרה (2–4 נקודות)\n"
-        "5) שאלה קצרה (רק אם חסר פרט קריטי)\n"
+        "את עוזרת לאימהות אחרי לידה. כתבי בעברית קצרה ופשוטה.\n"
+        "חוקים: לא לאבחן. להסתמך על המאגר. אם חסר מידע—שאלה אחת קצרה.\n"
+        "בלי פתיח קבוע. אמפתיה רק אם יש מצוקה."
     )
 
     user = (
-        f"שאלת האמא (עכשיו): {req.question}\n\n"
-        f"הקשר שיחה קודם:\n{history_text or '(אין הקשר קודם)'}\n\n"
+        f"שאלה: {req.question}\n"
+        f"הקשר: {history_text or 'אין'}\n\n"
         f"מידע מהמאגר:\n{context}\n\n"
-        "אם אין במידע מהמאגר בסיס לתשובה מדויקת — שאלי שאלה אחת קצרה כדי לדייק (רלוונטית לנושא שנשאל)."
+        "עני בקצרה (6–10 שורות). אם חסר פרט—שאלה אחת."
     )
 
     resp = client.chat.completions.create(
@@ -650,7 +633,8 @@ def ask_final(req: AskReq):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.3,
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
     )
     t.mark("gpt_ms")
 
@@ -667,6 +651,6 @@ def ask_final(req: AskReq):
         "cached": False,
         "used_gpt": True,
         "top_score": round(top_score, 4),
-        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, tags, base) in top],
+        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
         "timing": t.snapshot(),
     }
