@@ -15,7 +15,7 @@ from openai import OpenAI
 # =========================
 # Config
 # =========================
-APP_VERSION = "render-test-10-fastcache"
+APP_VERSION = "render-test-11-followup-context"
 
 DB_PATH = "rag.db"
 TABLE = "rag_clean"
@@ -31,18 +31,21 @@ LOW_SCORE_CUTOFF = 0.65
 SOFT_CUTOFF = 0.45  # בפיילוט: מפעילים GPT גם בהתאמה בינונית
 
 CACHE_TTL_SECONDS = 7 * 24 * 3600
-PROMPT_VER = "v7-fastcache"
+PROMPT_VER = "v8-fastcache-followup"
 
 # ---- Speed controls ----
 HISTORY_LIMIT_DB = 6          # כמה הודעות לשלוף מה-DB
-HISTORY_LIMIT_TO_GPT = 4      # כמה להכניס באמת לפרומפט
-CLIP_Q_CHARS = 220            # קיצור שאלה מהמאגר
-CLIP_A_CHARS = 700            # קיצור תשובה מהמאגר
-MAX_TOKENS = 220              # מגביל אורך תשובת GPT (משפר זמן)
+HISTORY_LIMIT_TO_GPT = 4      # כמה להכניס לפרומפט
+CLIP_Q_CHARS = 220
+CLIP_A_CHARS = 700
+MAX_TOKENS = 220
 TEMPERATURE = 0.3
 
 # ---- Fast cache tuning ----
-FAST_CACHE_SCORE_MIN = 0.72   # מינימום ציון כדי לשמור תשובות "עובדתיות" בלי היסטוריה
+FAST_CACHE_SCORE_MIN = 0.72
+
+# ---- Follow-up tuning ----
+FOLLOWUP_HARD_FLOOR = 0.25    # מתחת לזה גם ב-follow-up לא נריץ GPT, אלא נשאל הבהרה חכמה
 # ----------------------
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -268,7 +271,6 @@ def make_cache_key_conversational(
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 def make_cache_key_fast(question: str, top_ids: List[int], k: int) -> str:
-    # שומר תשובות עובדתיות/FAQ בלי תלות בהיסטוריה/שיחה
     base = (
         f"{PROMPT_VER}|FAST|{CHAT_MODEL}|k={k}"
         f"|q={norm_q(question)}"
@@ -460,6 +462,36 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
 
     return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
 
+def topic_from_history(history: List[Tuple[str, str]]) -> str:
+    """
+    מפיק 'נושא' מההקשר הקודם כדי שפולבאק בשאלת המשך יהיה רלוונטי.
+    """
+    blob = " ".join([norm_q(c) for _, c in history[-HISTORY_LIMIT_TO_GPT:]])
+    if any(w in blob for w in ["הנקה", "שד", "פטמה", "סדק", "פטמות", "breast", "breastfeeding"]):
+        return "breastfeeding"
+    if any(w in blob for w in ["שינה", "התעורר", "לילה", "נרדם", "בכי", "בוכה"]):
+        return "sleep"
+    if any(w in blob for w in ["אוכל", "האכלה", "בקבוק", "שאיבה", "פורמולה", "ממל", "מ״ל"]):
+        return "feeding"
+    if any(w in blob for w in ["דימום", "תפרים", "כאב", "חום", "רחם"]):
+        return "postpartum"
+    return "generic"
+
+def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> str:
+    """
+    פולבאק לשאלת המשך קצרה: נשען על נושא ההיסטוריה (ולא רק על השאלה הנוכחית).
+    """
+    t = topic_from_history(history)
+    if t == "breastfeeding":
+        return "זה נשמע בהמשך להנקה/פטמות. כדי לדייק: את מחפשת משחה לפטמות פצועות או משהו למניעה? (מילה אחת: פצועות/מניעה)"
+    if t == "sleep":
+        return "זה נשמע בהמשך לשינה. כדי לדייק: בן/בת כמה התינוק, והבעיה בעיקר בהירדמות או יקיצות תכופות?"
+    if t == "feeding":
+        return "זה נשמע בהמשך לאוכל/האכלה. כדי לדייק: בן/בת כמה התינוק, והאם מדובר בהנקה, שאיבה או בקבוק?"
+    if t == "postpartum":
+        return "זה נשמע בהמשך להתאוששות אחרי לידה. כדי לדייק: כמה זמן אחרי לידה את, ומה התסמין המרכזי עכשיו?"
+    return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
+
 # =========================
 # Fast-cache classifier
 # =========================
@@ -475,6 +507,45 @@ def is_factual_question(question: str, top_score: float, history: List[Tuple[str
     ]
     return any(p in qn for p in patterns)
 
+# =========================
+# Follow-up detector
+# =========================
+def is_followup_question(question: str, history: List[Tuple[str, str]]) -> bool:
+    if not history:
+        return False
+
+    qn = norm_q(question)
+    if not qn:
+        return False
+
+    # קצר = לרוב המשך
+    if len(qn.split()) <= 5:
+        return True
+
+    # פתיחים אופייניים לשאלת המשך
+    starters = ["איזה", "מה", "איך", "כמה", "איפה", "זה", "כזו", "כזה", "אפשר"]
+    return any(qn.startswith(s) for s in starters)
+
+def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> str:
+    """
+    אם זו שאלת המשך קצרה – נחזק Retrieval ע"י הוספת שורת הקשר קצרה מה-user הקודם.
+    (מעלה score לשאלות קצרות כמו 'איזה משחה יש לפטמות')
+    """
+    if not is_followup_question(question, history):
+        return question
+
+    # מצא את הודעת ה-user האחרונה מההיסטוריה (לפני השאלה הנוכחית)
+    prev_user = ""
+    for role, content in reversed(history):
+        if role == "user" and content:
+            prev_user = content
+            break
+
+    if not prev_user:
+        return question
+
+    # הקשר + שאלה נוכחית
+    return f"הקשר: {clip(prev_user, 220)}\nשאלה: {question}"
 
 # =========================
 # Init
@@ -515,10 +586,12 @@ def reload_rag():
 @app.post("/ask")
 def ask(req: AskReq):
     t = Timer()
-    qv = get_embedding(req.question, timing=t)
+
+    q_for_retrieval = req.question
+    qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
-    top = retrieve_top_k(qv, req.question, req.k)
+    top = retrieve_top_k(qv, q_for_retrieval, req.k)
     t.mark("retrieve_ms")
 
     return {
@@ -541,64 +614,91 @@ def ask(req: AskReq):
 def ask_final(req: AskReq):
     t = Timer()
 
-    # 0) שימור שיחה
+    # 0) שימור שיחה + שליפת היסטוריה (חשוב: BEFORE שמירת השאלה הנוכחית)
+    history: List[Tuple[str, str]] = []
     if req.user_id and req.conversation_id:
         upsert_conversation(req.user_id, req.conversation_id)
-        add_message(req.conversation_id, "user", req.question)
 
-    history: List[Tuple[str, str]] = []
     if req.conversation_id:
         history = get_recent_messages(req.conversation_id, limit=HISTORY_LIMIT_DB)
         t.mark("history_ms")
 
-    # 1) Embedding
-    qv = get_embedding(req.question, timing=t)
+    # עכשיו שומרים את השאלה הנוכחית (כדי שההיסטוריה ששימשה להחלטות לא תכלול אותה)
+    if req.conversation_id:
+        add_message(req.conversation_id, "user", req.question)
+
+    # האם זו שאלת המשך?
+    followup = is_followup_question(req.question, history)
+
+    # 1) Embedding (עם שאלה מוגברת ל-Retrieval אם זו שאלת המשך קצרה)
+    q_for_retrieval = build_augmented_question(req.question, history)
+    qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
     # 2) Retrieval
-    top = retrieve_top_k(qv, req.question, req.k)
+    top = retrieve_top_k(qv, q_for_retrieval, req.k)
     t.mark("retrieve_ms")
 
     if not top:
+        ans = topic_fallback_followup(req.question, history) if followup else "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?"
         return {
-            "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?",
+            "answer": ans,
             "cached": False,
             "used_gpt": False,
             "cache_type": "none",
+            "followup": followup,
             "top_matches": [],
             "timing": t.snapshot(),
         }
 
     top_score = float(top[0][0])
 
-    # Guardrail
-    if top_score < SOFT_CUTOFF:
+    # Guardrail:
+    # - אם ציון ממש נמוך: לא מריצים GPT, אבל אם זה follow-up מחזירים פולבאק לפי היסטוריה
+    if top_score < FOLLOWUP_HARD_FLOOR:
+        ans = topic_fallback_followup(req.question, history) if followup else topic_fallback(req.question, top)
         return {
-            "answer": topic_fallback(req.question, top),
+            "answer": ans,
             "cached": False,
             "used_gpt": False,
             "cache_type": "none",
+            "followup": followup,
             "top_score": round(top_score, 4),
             "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                             for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
-    if (not PILOT_MODE) and (top_score < LOW_SCORE_CUTOFF):
+    # - אם מתחת ל-SOFT_CUTOFF: נחסום רק אם זה לא follow-up
+    if top_score < SOFT_CUTOFF and not followup:
         return {
             "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
             "cache_type": "none",
+            "followup": followup,
             "top_score": round(top_score, 4),
             "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                             for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
+    if (not PILOT_MODE) and (top_score < LOW_SCORE_CUTOFF) and not followup:
+        return {
+            "answer": topic_fallback(req.question, top),
+            "cached": False,
+            "used_gpt": False,
+            "cache_type": "none",
+            "followup": followup,
+            "top_score": round(top_score, 4),
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                            for (s, rid, *_r, _source, tags, base) in top],
+            "timing": t.snapshot(),
+        }
+
+    # Cache keys
     top_ids = [rid for (_, rid, *_r) in top]
 
-    # ✅ FAST CACHE decision
     use_fast = is_factual_question(req.question, top_score, history)
     if use_fast:
         ck = make_cache_key_fast(req.question, top_ids, req.k)
@@ -616,6 +716,7 @@ def ask_final(req: AskReq):
             "cached": True,
             "used_gpt": False,
             "cache_type": cache_type,
+            "followup": followup,
             "top_score": round(top_score, 4),
             "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                             for (s, rid, *_r, _source, tags, base) in top],
@@ -630,6 +731,7 @@ def ask_final(req: AskReq):
             "cached": False,
             "used_gpt": False,
             "cache_type": "none",
+            "followup": followup,
             "top_score": round(top_score, 4),
             "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                             for (s, rid, *_r, _source, tags, base) in top],
@@ -647,7 +749,7 @@ def ask_final(req: AskReq):
     )
     t.mark("build_context_ms")
 
-    # History (SHORT)
+    # History (SHORT) - לא שולחים היסטוריה ל-GPT עבור FAST
     history_text = ""
     if history and not use_fast:
         lines = []
@@ -685,6 +787,7 @@ def ask_final(req: AskReq):
 
     final_answer = resp.choices[0].message.content or ""
 
+    # שומרים תשובת עוזרת לשיחה
     if req.conversation_id:
         add_message(req.conversation_id, "assistant", final_answer)
 
@@ -696,6 +799,7 @@ def ask_final(req: AskReq):
         "cached": False,
         "used_gpt": True,
         "cache_type": cache_type,
+        "followup": followup,
         "top_score": round(top_score, 4),
         "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                         for (s, rid, *_r, _source, tags, base) in top],
