@@ -464,10 +464,7 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
 # Fast-cache classifier
 # =========================
 def is_factual_question(question: str, top_score: float, history: List[Tuple[str, str]]) -> bool:
-    # אם יש הקשר שיחה — לא FAST CACHE
-    if history:
-        return False
-
+    # שאלות "ידע/עובדות" אפשר לקאש גם בתוך שיחה
     if top_score < FAST_CACHE_SCORE_MIN:
         return False
 
@@ -477,6 +474,7 @@ def is_factual_question(question: str, top_score: float, history: List[Tuple[str
         "מה זה", "איך נקרא", "התפתחות", "שלב", "מתי תינוק"
     ]
     return any(p in qn for p in patterns)
+
 
 # =========================
 # Init
