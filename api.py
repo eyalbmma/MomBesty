@@ -15,7 +15,7 @@ from openai import OpenAI
 # =========================
 # Config
 # =========================
-APP_VERSION = "render-test-9-fast"
+APP_VERSION = "render-test-10-fastcache"
 
 DB_PATH = "rag.db"
 TABLE = "rag_clean"
@@ -31,7 +31,7 @@ LOW_SCORE_CUTOFF = 0.65
 SOFT_CUTOFF = 0.45  # בפיילוט: מפעילים GPT גם בהתאמה בינונית
 
 CACHE_TTL_SECONDS = 7 * 24 * 3600
-PROMPT_VER = "v6-fast-prompts"
+PROMPT_VER = "v7-fastcache"
 
 # ---- Speed controls ----
 HISTORY_LIMIT_DB = 6          # כמה הודעות לשלוף מה-DB
@@ -40,6 +40,9 @@ CLIP_Q_CHARS = 220            # קיצור שאלה מהמאגר
 CLIP_A_CHARS = 700            # קיצור תשובה מהמאגר
 MAX_TOKENS = 220              # מגביל אורך תשובת GPT (משפר זמן)
 TEMPERATURE = 0.3
+
+# ---- Fast cache tuning ----
+FAST_CACHE_SCORE_MIN = 0.72   # מינימום ציון כדי לשמור תשובות "עובדתיות" בלי היסטוריה
 # ----------------------
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -130,7 +133,6 @@ def ensure_rag_db():
     import gdown
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, DB_PATH, quiet=False)
-
     print("Downloaded rag.db size:", os.path.getsize(DB_PATH))
 
 # =========================
@@ -248,7 +250,7 @@ def get_recent_messages(conversation_id: str, limit: int = 12) -> List[Tuple[str
 # =========================
 # LLM answer cache
 # =========================
-def make_cache_key(
+def make_cache_key_conversational(
     question: str,
     top_ids: List[int],
     k: int,
@@ -262,6 +264,15 @@ def make_cache_key(
         f"|q={norm_q(question)}"
         f"|ids={','.join(map(str, top_ids))}"
         f"|hist={hist_compact}"
+    )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def make_cache_key_fast(question: str, top_ids: List[int], k: int) -> str:
+    # שומר תשובות עובדתיות/FAQ בלי תלות בהיסטוריה/שיחה
+    base = (
+        f"{PROMPT_VER}|FAST|{CHAT_MODEL}|k={k}"
+        f"|q={norm_q(question)}"
+        f"|ids={','.join(map(str, top_ids))}"
     )
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
@@ -450,6 +461,24 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
     return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
 
 # =========================
+# Fast-cache classifier
+# =========================
+def is_factual_question(question: str, top_score: float, history: List[Tuple[str, str]]) -> bool:
+    # אם יש הקשר שיחה — לא FAST CACHE
+    if history:
+        return False
+
+    if top_score < FAST_CACHE_SCORE_MIN:
+        return False
+
+    qn = norm_q(question)
+    patterns = [
+        "בן כמה", "בת כמה", "מתי", "באיזה גיל", "כמה זמן", "מתי מתחיל",
+        "מה זה", "איך נקרא", "התפתחות", "שלב", "מתי תינוק"
+    ]
+    return any(p in qn for p in patterns)
+
+# =========================
 # Init
 # =========================
 ensure_rag_db()
@@ -473,6 +502,7 @@ def health():
         "top_score_threshold": TOP_SCORE_THRESHOLD,
         "low_score_cutoff": LOW_SCORE_CUTOFF,
         "soft_cutoff": SOFT_CUTOFF,
+        "fast_cache_score_min": FAST_CACHE_SCORE_MIN,
         "chat_model": CHAT_MODEL,
         "embed_model": EMBED_MODEL,
         "rag_rows_loaded": len(RAG_ROWS),
@@ -536,6 +566,7 @@ def ask_final(req: AskReq):
             "answer": "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?",
             "cached": False,
             "used_gpt": False,
+            "cache_type": "none",
             "top_matches": [],
             "timing": t.snapshot(),
         }
@@ -548,8 +579,10 @@ def ask_final(req: AskReq):
             "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
+            "cache_type": "none",
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                            for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -558,14 +591,23 @@ def ask_final(req: AskReq):
             "answer": topic_fallback(req.question, top),
             "cached": False,
             "used_gpt": False,
+            "cache_type": "none",
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                            for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
-    # Cache key
     top_ids = [rid for (_, rid, *_r) in top]
-    ck = make_cache_key(req.question, top_ids, req.k, req.conversation_id, history)
+
+    # ✅ FAST CACHE decision
+    use_fast = is_factual_question(req.question, top_score, history)
+    if use_fast:
+        ck = make_cache_key_fast(req.question, top_ids, req.k)
+        cache_type = "fast"
+    else:
+        ck = make_cache_key_conversational(req.question, top_ids, req.k, req.conversation_id, history)
+        cache_type = "conversational"
 
     cached = cache_get(ck)
     t.mark("cache_get_ms")
@@ -575,8 +617,10 @@ def ask_final(req: AskReq):
             "answer": cached,
             "cached": True,
             "used_gpt": False,
+            "cache_type": cache_type,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                            for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -587,8 +631,10 @@ def ask_final(req: AskReq):
             "answer": aa,
             "cached": False,
             "used_gpt": False,
+            "cache_type": "none",
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                            for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -605,7 +651,7 @@ def ask_final(req: AskReq):
 
     # History (SHORT)
     history_text = ""
-    if history:
+    if history and not use_fast:
         lines = []
         for role, content in history[-HISTORY_LIMIT_TO_GPT:]:
             role_h = "אמא" if role == "user" else "עוזרת"
@@ -613,27 +659,20 @@ def ask_final(req: AskReq):
         history_text = "\n".join(lines)
     t.mark("build_history_ms")
 
-    # SHORT prompts
+    # Prompts (SHORT + controlled empathy)
     system = (
-    "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה וקצרה.\n"
-    "חוקים:\n"
-    "1) אל תאבחני ואל תקבעי מצבים רפואיים.\n"
-    "2) הסתמכי על מידע מהמאגר בלבד.\n"
-    "3) אם חסר מידע — שאלי שאלה אחת קצרה ורלוונטית.\n"
-    "סגנון:\n"
-    "- בלי פתיח קבוע.\n"
-    "- אם בשאלה יש סימני עומס או מצוקה (כאב חזק, חוסר שינה קיצוני, בלבול, הצפה) — הוסיפי משפט אמפתי אחד בלבד.\n"
-    "- אחרת, גשי ישר לתשובה."
-)
-
+        "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה וקצרה.\n"
+        "חוקים: אל תאבחני. הסתמכי על מידע מהמאגר בלבד. אם חסר מידע—שאלה אחת קצרה.\n"
+        "סגנון: בלי פתיח קבוע. אם יש סימני עומס/מצוקה (כאב חזק, חוסר שינה קיצוני, בלבול, הצפה) "
+        "הוסיפי משפט אמפתי אחד בלבד. אחרת—גשי ישר לתשובה."
+    )
 
     user = (
-    f"שאלה: {req.question}\n"
-    f"הקשר קודם (אם יש): {history_text or 'אין'}\n\n"
-    f"מידע מהמאגר:\n{context}\n\n"
-    "עני בקצרה ובצורה מעשית. אם חסר פרט קריטי — שאלי שאלה אחת."
-)
-
+        f"שאלה: {req.question}\n"
+        f"הקשר קודם: {history_text or 'אין'}\n\n"
+        f"מידע מהמאגר:\n{context}\n\n"
+        "עני בקצרה ובצורה מעשית (6–10 שורות). אם חסר פרט קריטי—שאלה אחת."
+    )
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -658,7 +697,9 @@ def ask_final(req: AskReq):
         "answer": final_answer,
         "cached": False,
         "used_gpt": True,
+        "cache_type": cache_type,
         "top_score": round(top_score, 4),
-        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
+        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                        for (s, rid, *_r, _source, tags, base) in top],
         "timing": t.snapshot(),
     }
