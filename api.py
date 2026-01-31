@@ -50,18 +50,33 @@ FOLLOWUP_HARD_FLOOR = 0.25    # מתחת לזה גם ב-follow-up לא נריץ 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
+from forum_api import router as forum_router
+from content_api import router as content_router
+from tracker_api import router as tracker_router
 
+
+app.include_router(forum_router)
+app.include_router(content_router)
+app.include_router(tracker_router)
 # =========================
 # CORS
 # =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https://.*\.netlify\.app$",
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:19006",
+        "http://127.0.0.1:19006",
+        "http://192.168.1.144:8081",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 @app.options("/ask_final")
 def options_ask_final():
@@ -83,6 +98,8 @@ class AskReq(BaseModel):
     k: int = 3
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
+    topic: Optional[str] = None
+
 
 # =========================
 # Timing utilities
