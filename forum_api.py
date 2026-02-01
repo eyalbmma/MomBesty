@@ -32,13 +32,13 @@ class CreatePostReq(BaseModel):
     user_id: str
     content: str
     is_anonymous: bool = True
-    display_name: Optional[str] = None  # ✅ חדש (כינוי)
+    display_name: Optional[str] = None  # ✅ כינוי
 
 
 class CreateCommentReq(BaseModel):
     user_id: str
     content: str
-    display_name: Optional[str] = None  # ✅ חדש (כינוי)
+    display_name: Optional[str] = None  # ✅ כינוי
 
 
 class ReportReq(BaseModel):
@@ -93,8 +93,6 @@ def create_post(req: CreatePostReq):
     con = db_connect()
     cur = con.cursor()
 
-    # ✅ אם אין לך עמודת display_name עדיין, זה ייפול.
-    # מומלץ להריץ migration (מצורף למטה).
     cur.execute(
         """
         INSERT INTO forum_posts(user_id, content, is_anonymous, display_name, created_at)
@@ -122,50 +120,55 @@ def create_post(req: CreatePostReq):
 
 
 @router.get("/posts")
-def get_posts(limit: int = 20, before: Optional[int] = None):
+def get_posts(
+    limit: int = 20,
+    before: Optional[int] = None,
+    user_id: Optional[str] = None,  # ✅ חדש: רק הפוסטים שלי
+    q: Optional[str] = None,        # ✅ חדש: חיפוש טקסט
+):
+    # hard cap
     limit = min(max(int(limit), 1), 50)
 
     con = db_connect()
     cur = con.cursor()
 
-    if before is None:
-        cur.execute(
-            """
-            SELECT
-              p.id,
-              p.user_id,
-              p.display_name,
-              p.is_anonymous,
-              p.content,
-              p.empathy_count,
-              p.created_at,
-              (SELECT COUNT(1) FROM forum_comments c WHERE c.post_id = p.id AND c.status='active') AS comments_count
-            FROM forum_posts p
-            WHERE p.status='active'
-            ORDER BY p.created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT
-              p.id,
-              p.user_id,
-              p.display_name,
-              p.is_anonymous,
-              p.content,
-              p.empathy_count,
-              p.created_at,
-              (SELECT COUNT(1) FROM forum_comments c WHERE c.post_id = p.id AND c.status='active') AS comments_count
-            FROM forum_posts p
-            WHERE p.status='active' AND p.created_at < ?
-            ORDER BY p.created_at DESC
-            LIMIT ?
-            """,
-            (int(before), limit),
-        )
+    where_parts = ["p.status='active'"]
+    params = []
+
+    if before is not None:
+        where_parts.append("p.created_at < ?")
+        params.append(int(before))
+
+    if user_id:
+        where_parts.append("p.user_id = ?")
+        params.append(user_id)
+
+    if q:
+        q_clean = (q or "").strip()
+        if q_clean:
+            where_parts.append("p.content LIKE ?")
+            params.append(f"%{q_clean}%")
+
+    where_sql = " AND ".join(where_parts)
+
+    cur.execute(
+        f"""
+        SELECT
+          p.id,
+          p.user_id,
+          p.display_name,
+          p.is_anonymous,
+          p.content,
+          p.empathy_count,
+          p.created_at,
+          (SELECT COUNT(1) FROM forum_comments c WHERE c.post_id = p.id AND c.status='active') AS comments_count
+        FROM forum_posts p
+        WHERE {where_sql}
+        ORDER BY p.created_at DESC
+        LIMIT ?
+        """,
+        (*params, limit),
+    )
 
     rows = cur.fetchall()
     con.close()
@@ -231,32 +234,57 @@ def add_comment(post_id: int, req: CreateCommentReq):
 
 
 @router.get("/posts/{post_id}/comments")
-def get_comments(post_id: int):
+def get_comments(
+    post_id: int,
+    limit: int = 50,               # ✅ חדש: כמה להחזיר בכל פעם (ברירת מחדל גבוהה כדי לא לשבור)
+    after: Optional[int] = None,   # ✅ חדש: פג'ינציה קדימה (created_at > after)
+):
+    limit = min(max(int(limit), 1), 50)
+
     con = db_connect()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT id, post_id, user_id, content, created_at
-        FROM forum_comments
-        WHERE post_id=? AND status='active'
-        ORDER BY created_at ASC
-        """,
-        (post_id,),
-    )
+
+    if after is None:
+        cur.execute(
+            """
+            SELECT id, post_id, user_id, display_name, content, created_at
+            FROM forum_comments
+            WHERE post_id=? AND status='active'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (post_id, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, post_id, user_id, display_name, content, created_at
+            FROM forum_comments
+            WHERE post_id=? AND status='active' AND created_at > ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (post_id, int(after), limit),
+        )
+
     rows = cur.fetchall()
     con.close()
+
+    next_after = int(rows[-1]["created_at"]) if rows else None
 
     return {
         "comments": [
             {
-                "id": r[0],
-                "post_id": r[1],
-                "user_id": r[2],
-                "content": r[3],
-                "created_at": r[4],
+                "id": int(r["id"]),
+                "post_id": int(r["post_id"]),
+                "user_id": r["user_id"],
+                "display_name": r["display_name"],
+                "content": r["content"],
+                "created_at": int(r["created_at"]),
             }
             for r in rows
-        ]
+        ],
+        "next_after": next_after,
     }
 
 
@@ -305,7 +333,11 @@ def add_empathy(post_id: int, req: EmpathyReq):
         cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (post_id,))
         row = cur.fetchone()
         con.close()
-        return {"ok": True, "already": True, "empathy_count": int(row["empathy_count"]) if row else None}
+        return {
+            "ok": True,
+            "already": True,
+            "empathy_count": int(row["empathy_count"]) if row else None,
+        }
 
     # 2) increment counter
     cur.execute(
