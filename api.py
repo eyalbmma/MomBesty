@@ -50,14 +50,15 @@ FOLLOWUP_HARD_FLOOR = 0.25    # מתחת לזה גם ב-follow-up לא נריץ 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
+
 from forum_api import router as forum_router
 from content_api import router as content_router
 from tracker_api import router as tracker_router
 
-
 app.include_router(forum_router)
 app.include_router(content_router)
 app.include_router(tracker_router)
+
 # =========================
 # CORS
 # =========================
@@ -75,8 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 
 @app.options("/ask_final")
 def options_ask_final():
@@ -99,7 +98,6 @@ class AskReq(BaseModel):
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
     topic: Optional[str] = None
-
 
 # =========================
 # Timing utilities
@@ -159,7 +157,9 @@ def ensure_rag_db():
 # SQLite helpers
 # =========================
 def db_connect():
-    return sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
 def column_exists(table: str, col: str) -> bool:
     con = db_connect()
@@ -172,9 +172,14 @@ def column_exists(table: str, col: str) -> bool:
         con.close()
 
 def ensure_tables():
+    """
+    יוצר טבלאות מערכת (cache / conversations) + טבלאות התראות לפורום.
+    חשוב במיוחד ב-Render כי rag.db יכול להגיע מ-Drive בלי הטבלאות החדשות.
+    """
     con = db_connect()
     cur = con.cursor()
 
+    # ---- LLM cache ----
     cur.execute("""
         CREATE TABLE IF NOT EXISTS llm_cache (
             cache_key TEXT PRIMARY KEY,
@@ -183,6 +188,7 @@ def ensure_tables():
         );
     """)
 
+    # ---- Embedding cache ----
     cur.execute("""
         CREATE TABLE IF NOT EXISTS emb_cache (
             q_norm TEXT PRIMARY KEY,
@@ -191,6 +197,7 @@ def ensure_tables():
         );
     """)
 
+    # ---- Conversations ----
     cur.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -213,6 +220,52 @@ def ensure_tables():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_conv_msgs_conv_time
         ON conversation_messages(conversation_id, created_at);
+    """)
+
+    # =========================================================
+    # Forum notifications + push tokens (NEW)
+    # =========================================================
+
+    # Expo Push tokens per user/device
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forum_push_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            token TEXT NOT NULL,
+            platform TEXT,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            UNIQUE(user_id, token)
+        );
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_forum_push_tokens_user
+        ON forum_push_tokens(user_id);
+    """)
+
+    # Notifications table (badge = count unread where read_at is NULL)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forum_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            post_id INTEGER,
+            comment_id INTEGER,
+            from_user_id TEXT,
+            created_at INTEGER NOT NULL,
+            read_at INTEGER
+        );
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_read
+        ON forum_notifications(user_id, read_at, created_at);
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_forum_notifications_post
+        ON forum_notifications(post_id, created_at);
     """)
 
     con.commit()
@@ -265,7 +318,7 @@ def get_recent_messages(conversation_id: str, limit: int = 12) -> List[Tuple[str
     rows = cur.fetchall()
     con.close()
     rows = list(reversed(rows))
-    return [(r or "", c or "") for (r, c) in rows]
+    return [(r["role"] or "", r["content"] or "") for r in rows]
 
 # =========================
 # LLM answer cache
@@ -303,7 +356,7 @@ def cache_get(key: str) -> Optional[str]:
     con.close()
     if not row:
         return None
-    ans, ts = row
+    ans, ts = row["answer"], int(row["created_at"])
     if time.time() - ts > CACHE_TTL_SECONDS:
         return None
     return ans
@@ -329,7 +382,7 @@ def emb_cache_get(q_norm: str) -> Optional[np.ndarray]:
     con.close()
     if not row:
         return None
-    emb_json, ts = row
+    emb_json, ts = row["embedding"], int(row["created_at"])
     if time.time() - ts > CACHE_TTL_SECONDS:
         return None
     try:

@@ -1,7 +1,9 @@
+import os
 import time
 import sqlite3
-from typing import Optional
+from typing import Optional, List
 
+import requests
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -19,6 +21,10 @@ MAX_POST_LEN = 800
 MIN_POST_LEN = 20
 MAX_COMMENT_LEN = 400
 MIN_COMMENT_LEN = 5
+
+# ---- Push / notifications ----
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+MAX_PUSH_BODY_CHARS = 140
 
 
 def db_connect():
@@ -52,6 +58,30 @@ class EmpathyReq(BaseModel):
     user_id: str
 
 
+class PushTokenReq(BaseModel):
+    user_id: str
+    token: str  # ExponentPushToken[...]
+    platform: Optional[str] = None  # 'android' / 'ios'
+
+
+class MarkReadReq(BaseModel):
+    user_id: str
+    notification_ids: Optional[List[int]] = None
+    post_id: Optional[int] = None
+    all: bool = False
+
+
+# --------- helpers ---------
+def _clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _is_expo_token(token: str) -> bool:
+    t = (token or "").strip()
+    return t.startswith("ExponentPushToken[") or t.startswith("ExpoPushToken[")
+
+
 # --------- Rate limit helper ---------
 def check_rate_limit(user_id: str, action: str, cooldown_sec: int) -> bool:
     now = int(time.time())
@@ -75,6 +105,236 @@ def check_rate_limit(user_id: str, action: str, cooldown_sec: int) -> bool:
     con.commit()
     con.close()
     return True
+
+
+# --------- Push tokens ---------
+@router.post("/push-tokens")
+def upsert_push_token(req: PushTokenReq):
+    user_id = (req.user_id or "").strip()
+    token = (req.token or "").strip()
+    platform = (req.platform or "").strip() or None
+    now = int(time.time())
+
+    if not user_id:
+        return {"ok": False, "error": "user_id חסר"}
+    if not token:
+        return {"ok": False, "error": "token חסר"}
+    if not _is_expo_token(token):
+        return {"ok": False, "error": "token לא נראה כמו Expo Push Token"}
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # נשמור UNIQUE(user_id, token) כך שלא יהיו כפילויות
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO forum_push_tokens(user_id, token, platform, created_at, last_seen_at)
+        VALUES(?,?,?,?,?)
+        """,
+        (user_id, token, platform, now, now),
+    )
+
+    # אם כבר קיים - נעדכן last_seen_at / platform
+    cur.execute(
+        """
+        UPDATE forum_push_tokens
+        SET last_seen_at = ?, platform = COALESCE(?, platform)
+        WHERE user_id = ? AND token = ?
+        """,
+        (now, platform, user_id, token),
+    )
+
+    con.commit()
+    con.close()
+    return {"ok": True}
+
+
+def _get_user_push_tokens(user_id: str) -> List[str]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT token FROM forum_push_tokens WHERE user_id=?",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [r["token"] for r in rows if r and r["token"]]
+
+
+def _send_expo_push(tokens: List[str], title: str, body: str, data: dict):
+    """
+    שליחה דרך Expo Push Service.
+    - לא מפיל את הבקשה אם נכשל (best-effort).
+    """
+    tokens = [t for t in (tokens or []) if _is_expo_token(t)]
+    if not tokens:
+        return {"ok": True, "sent": 0}
+
+    payload = []
+    for t in tokens:
+        payload.append(
+            {
+                "to": t,
+                "title": title,
+                "body": _clip(body, MAX_PUSH_BODY_CHARS),
+                "data": data or {},
+                "sound": "default",
+            }
+        )
+
+    try:
+        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
+        # Expo לרוב מחזיר JSON עם data = tickets
+        return {"ok": True, "sent": len(tokens), "status": resp.status_code}
+    except Exception:
+        return {"ok": False, "sent": 0}
+
+
+# --------- Notifications ---------
+@router.get("/notifications/unread-count")
+def unread_count(user_id: str):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return {"ok": False, "error": "user_id חסר"}
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(1) AS cnt
+        FROM forum_notifications
+        WHERE user_id=? AND read_at IS NULL
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    return {"ok": True, "unread": int(row["cnt"] or 0) if row else 0}
+
+
+@router.get("/notifications")
+def list_notifications(user_id: str, limit: int = 30):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return {"ok": False, "error": "user_id חסר"}
+
+    limit = min(max(int(limit), 1), 50)
+
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, type, post_id, comment_id, from_user_id, created_at, read_at
+        FROM forum_notifications
+        WHERE user_id=?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    con.close()
+
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": int(r["id"]),
+                "user_id": r["user_id"],
+                "type": r["type"],
+                "post_id": int(r["post_id"]) if r["post_id"] is not None else None,
+                "comment_id": int(r["comment_id"]) if r["comment_id"] is not None else None,
+                "from_user_id": r["from_user_id"],
+                "created_at": int(r["created_at"]),
+                "read_at": int(r["read_at"]) if r["read_at"] is not None else None,
+            }
+        )
+
+    return {"ok": True, "notifications": out}
+
+
+@router.post("/notifications/mark-read")
+def mark_read(req: MarkReadReq):
+    user_id = (req.user_id or "").strip()
+    if not user_id:
+        return {"ok": False, "error": "user_id חסר"}
+
+    now = int(time.time())
+    con = db_connect()
+    cur = con.cursor()
+
+    updated = 0
+
+    if req.all:
+        cur.execute(
+            """
+            UPDATE forum_notifications
+            SET read_at = ?
+            WHERE user_id=? AND read_at IS NULL
+            """,
+            (now, user_id),
+        )
+        updated = cur.rowcount
+
+    elif req.post_id is not None:
+        cur.execute(
+            """
+            UPDATE forum_notifications
+            SET read_at = ?
+            WHERE user_id=? AND post_id=? AND read_at IS NULL
+            """,
+            (now, user_id, int(req.post_id)),
+        )
+        updated = cur.rowcount
+
+    elif req.notification_ids:
+        ids = [int(x) for x in req.notification_ids if x is not None]
+        if ids:
+            placeholders = ",".join(["?"] * len(ids))
+            cur.execute(
+                f"""
+                UPDATE forum_notifications
+                SET read_at = ?
+                WHERE user_id=? AND read_at IS NULL AND id IN ({placeholders})
+                """,
+                (now, user_id, *ids),
+            )
+            updated = cur.rowcount
+
+    con.commit()
+    con.close()
+    return {"ok": True, "updated": int(updated)}
+
+
+def _create_notification_for_comment(
+    owner_user_id: str,
+    from_user_id: str,
+    post_id: int,
+    comment_id: int,
+):
+    now = int(time.time())
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO forum_notifications(user_id, type, post_id, comment_id, from_user_id, created_at, read_at)
+        VALUES(?,?,?,?,?,?,NULL)
+        """,
+        (owner_user_id, "comment_on_my_post", int(post_id), int(comment_id), from_user_id, now),
+    )
+    nid = cur.lastrowid
+    con.commit()
+    con.close()
+    return nid, now
+
+
+def _get_post_owner(post_id: int) -> Optional[str]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT user_id FROM forum_posts WHERE id=? AND status='active'", (int(post_id),))
+    row = cur.fetchone()
+    con.close()
+    return row["user_id"] if row else None
 
 
 # --------- Posts ---------
@@ -123,10 +383,9 @@ def create_post(req: CreatePostReq):
 def get_posts(
     limit: int = 20,
     before: Optional[int] = None,
-    user_id: Optional[str] = None,  # ✅ חדש: רק הפוסטים שלי
-    q: Optional[str] = None,        # ✅ חדש: חיפוש טקסט
+    user_id: Optional[str] = None,  # ✅ רק הפוסטים שלי
+    q: Optional[str] = None,        # ✅ חיפוש
 ):
-    # hard cap
     limit = min(max(int(limit), 1), 50)
 
     con = db_connect()
@@ -214,17 +473,40 @@ def add_comment(post_id: int, req: CreateCommentReq):
         INSERT INTO forum_comments(post_id, user_id, content, display_name, created_at)
         VALUES(?,?,?,?,?)
         """,
-        (post_id, req.user_id, content, display_name, now),
+        (int(post_id), req.user_id, content, display_name, now),
     )
     comment_id = cur.lastrowid
     con.commit()
     con.close()
 
+    # --- Notifications + Push (best-effort) ---
+    owner_user_id = _get_post_owner(int(post_id))
+    if owner_user_id and owner_user_id != req.user_id:
+        try:
+            _nid, _created_at = _create_notification_for_comment(
+                owner_user_id=owner_user_id,
+                from_user_id=req.user_id,
+                post_id=int(post_id),
+                comment_id=int(comment_id),
+            )
+
+            tokens = _get_user_push_tokens(owner_user_id)
+            if tokens:
+                _send_expo_push(
+                    tokens=tokens,
+                    title="תגובה חדשה לפוסט שלך",
+                    body=content,
+                    data={"screen": "ForumPost", "postId": int(post_id), "commentId": int(comment_id)},
+                )
+        except Exception:
+            # לא מפילים יצירת תגובה אם push/notification נכשל
+            pass
+
     return {
         "ok": True,
         "comment": {
-            "id": comment_id,
-            "post_id": post_id,
+            "id": int(comment_id),
+            "post_id": int(post_id),
             "user_id": req.user_id,
             "display_name": display_name,
             "content": content,
@@ -236,8 +518,8 @@ def add_comment(post_id: int, req: CreateCommentReq):
 @router.get("/posts/{post_id}/comments")
 def get_comments(
     post_id: int,
-    limit: int = 50,               # ✅ חדש: כמה להחזיר בכל פעם (ברירת מחדל גבוהה כדי לא לשבור)
-    after: Optional[int] = None,   # ✅ חדש: פג'ינציה קדימה (created_at > after)
+    limit: int = 50,
+    after: Optional[int] = None,
 ):
     limit = min(max(int(limit), 1), 50)
 
@@ -253,7 +535,7 @@ def get_comments(
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (post_id, limit),
+            (int(post_id), limit),
         )
     else:
         cur.execute(
@@ -264,7 +546,7 @@ def get_comments(
             ORDER BY created_at ASC
             LIMIT ?
             """,
-            (post_id, int(after), limit),
+            (int(post_id), int(after), limit),
         )
 
     rows = cur.fetchall()
@@ -304,7 +586,7 @@ def report(req: ReportReq):
         INSERT INTO forum_reports(target_type, target_id, reporter_user_id, reason, created_at)
         VALUES(?,?,?,?,?)
         """,
-        (req.target_type, req.target_id, req.reporter_user_id, req.reason, int(time.time())),
+        (req.target_type, int(req.target_id), req.reporter_user_id, req.reason, int(time.time())),
     )
     con.commit()
     con.close()
@@ -323,14 +605,13 @@ def add_empathy(post_id: int, req: EmpathyReq):
     con = db_connect()
     cur = con.cursor()
 
-    # 1) save unique empathy (PK/UNIQUE on (post_id,user_id) recommended)
     try:
         cur.execute(
             "INSERT INTO forum_empathy(post_id, user_id, created_at) VALUES(?,?,?)",
-            (post_id, user_id, now),
+            (int(post_id), user_id, now),
         )
     except sqlite3.IntegrityError:
-        cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (post_id,))
+        cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (int(post_id),))
         row = cur.fetchone()
         con.close()
         return {
@@ -339,25 +620,24 @@ def add_empathy(post_id: int, req: EmpathyReq):
             "empathy_count": int(row["empathy_count"]) if row else None,
         }
 
-    # 2) increment counter
     cur.execute(
         """
         UPDATE forum_posts
         SET empathy_count = empathy_count + 1
         WHERE id = ? AND status='active'
         """,
-        (post_id,),
+        (int(post_id),),
     )
 
     if cur.rowcount == 0:
-        cur.execute("DELETE FROM forum_empathy WHERE post_id=? AND user_id=?", (post_id, user_id))
+        cur.execute("DELETE FROM forum_empathy WHERE post_id=? AND user_id=?", (int(post_id), user_id))
         con.commit()
         con.close()
         return {"ok": False, "error": "פוסט לא נמצא / לא פעיל"}
 
     con.commit()
 
-    cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (post_id,))
+    cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (int(post_id),))
     row = cur.fetchone()
     con.close()
     return {"ok": True, "already": False, "empathy_count": int(row["empathy_count"]) if row else None}
@@ -375,7 +655,7 @@ def delete_post(post_id: int, user_id: str):
         SET status='deleted'
         WHERE id=? AND user_id=? AND status='active'
         """,
-        (post_id, user_id),
+        (int(post_id), user_id),
     )
 
     if cur.rowcount == 0:
@@ -384,7 +664,7 @@ def delete_post(post_id: int, user_id: str):
 
     cur.execute(
         "UPDATE forum_comments SET status='deleted' WHERE post_id=? AND status='active'",
-        (post_id,),
+        (int(post_id),),
     )
 
     con.commit()
@@ -403,7 +683,7 @@ def delete_comment(comment_id: int, user_id: str):
         SET status='deleted'
         WHERE id=? AND user_id=? AND status='active'
         """,
-        (comment_id, user_id),
+        (int(comment_id), user_id),
     )
 
     if cur.rowcount == 0:
