@@ -1,6 +1,6 @@
 import time
 import sqlite3
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -134,6 +134,7 @@ def upsert_push_token(req: PushTokenReq):
     try:
         cur = con.cursor()
 
+        # נשמור UNIQUE(user_id, token) כך שלא יהיו כפילויות
         cur.execute(
             """
             INSERT OR IGNORE INTO forum_push_tokens(user_id, token, platform, created_at, last_seen_at)
@@ -142,6 +143,7 @@ def upsert_push_token(req: PushTokenReq):
             (user_id, token, platform, now, now),
         )
 
+        # אם כבר קיים - נעדכן last_seen_at / platform
         cur.execute(
             """
             UPDATE forum_push_tokens
@@ -169,20 +171,25 @@ def _get_user_push_tokens(user_id: str) -> List[str]:
 
 
 def _send_expo_push(tokens: List[str], title: str, body: str, data: dict):
+    """
+    שליחה דרך Expo Push Service.
+    - לא מפיל את הבקשה אם נכשל (best-effort).
+    """
     tokens = [t for t in (tokens or []) if _is_expo_token(t)]
     if not tokens:
         return {"ok": True, "sent": 0}
 
-    payload = [
-        {
-            "to": t,
-            "title": title,
-            "body": _clip(body, MAX_PUSH_BODY_CHARS),
-            "data": data or {},
-            "sound": "default",
-        }
-        for t in tokens
-    ]
+    payload = []
+    for t in tokens:
+        payload.append(
+            {
+                "to": t,
+                "title": title,
+                "body": _clip(body, MAX_PUSH_BODY_CHARS),
+                "data": data or {},
+                "sound": "default",
+            }
+        )
 
     try:
         resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
@@ -363,10 +370,11 @@ def create_post(req: CreatePostReq):
     con = db_connect()
     try:
         cur = con.cursor()
+        # ✅ חשוב: בלי comments_count/status כדי לא לשבור DB
         cur.execute(
             """
-            INSERT INTO forum_posts(user_id, content, is_anonymous, display_name, created_at, empathy_count, comments_count, status)
-            VALUES(?,?,?,?,?,0,0,'active')
+            INSERT INTO forum_posts(user_id, content, is_anonymous, display_name, created_at)
+            VALUES(?,?,?,?,?)
             """,
             (user_id, content, int(req.is_anonymous), display_name, now),
         )
@@ -422,6 +430,7 @@ def get_posts(
 
         where_sql = " AND ".join(where_parts)
 
+        # ✅ comments_count מחושב ולא שדה בטבלה
         cur.execute(
             f"""
             SELECT
@@ -431,8 +440,10 @@ def get_posts(
               p.is_anonymous,
               p.content,
               p.empathy_count,
-              p.comments_count,
-              p.created_at
+              p.created_at,
+              (SELECT COUNT(1) 
+               FROM forum_comments c 
+               WHERE c.post_id = p.id AND c.status='active') AS comments_count
             FROM forum_posts p
             WHERE {where_sql}
             ORDER BY p.created_at DESC
@@ -444,26 +455,27 @@ def get_posts(
         rows = cur.fetchall()
         next_before = int(rows[-1]["created_at"]) if rows else None
 
-        posts = [
-            {
-                "id": int(r["id"]),
-                "user_id": r["user_id"],
-                "display_name": r["display_name"],
-                "is_anonymous": bool(int(r["is_anonymous"])),
-                "content": r["content"],
-                "empathy_count": int(r["empathy_count"] or 0),
-                "created_at": int(r["created_at"]),
-                "comments_count": int(r["comments_count"] or 0),
-            }
-            for r in rows
-        ]
+        posts = []
+        for r in rows:
+            posts.append(
+                {
+                    "id": int(r["id"]),
+                    "user_id": r["user_id"],
+                    "display_name": r["display_name"],
+                    "is_anonymous": bool(int(r["is_anonymous"])),
+                    "content": r["content"],
+                    "empathy_count": int(r["empathy_count"] or 0),
+                    "created_at": int(r["created_at"]),
+                    "comments_count": int(r["comments_count"] or 0),
+                }
+            )
 
         return {"posts": posts, "next_before": next_before}
     finally:
         con.close()
 
 
-# ✅✅✅ זה ה-ENDPOINT שחסר לך לפי צד לקוח
+# ✅✅✅ ENDPOINT שחסר לאפליקציה: GET /forum/posts/{post_id}
 @router.get("/posts/{post_id}")
 def get_post_by_id(post_id: int):
     con = db_connect()
@@ -472,9 +484,18 @@ def get_post_by_id(post_id: int):
         cur.execute(
             """
             SELECT
-              id, user_id, display_name, is_anonymous, content, empathy_count, comments_count, created_at
-            FROM forum_posts
-            WHERE id=? AND status='active'
+              p.id,
+              p.user_id,
+              p.display_name,
+              p.is_anonymous,
+              p.content,
+              p.empathy_count,
+              p.created_at,
+              (SELECT COUNT(1) 
+               FROM forum_comments c 
+               WHERE c.post_id = p.id AND c.status='active') AS comments_count
+            FROM forum_posts p
+            WHERE p.id=? AND p.status='active'
             """,
             (int(post_id),),
         )
@@ -522,29 +543,19 @@ def add_comment(post_id: int, req: CreateCommentReq):
         cur = con.cursor()
 
         # ודא שהפוסט קיים ופעיל
-        cur.execute("SELECT id, user_id FROM forum_posts WHERE id=? AND status='active'", (int(post_id),))
+        cur.execute("SELECT id FROM forum_posts WHERE id=? AND status='active'", (int(post_id),))
         post_row = cur.fetchone()
         if not post_row:
             return {"ok": False, "error": "פוסט לא נמצא / לא פעיל"}
 
         cur.execute(
             """
-            INSERT INTO forum_comments(post_id, user_id, content, display_name, created_at, status)
-            VALUES(?,?,?,?,?,'active')
+            INSERT INTO forum_comments(post_id, user_id, content, display_name, created_at)
+            VALUES(?,?,?,?,?)
             """,
             (int(post_id), user_id, content, display_name, now),
         )
         comment_id = cur.lastrowid
-
-        # עדכון comments_count מהיר
-        cur.execute(
-            """
-            UPDATE forum_posts
-            SET comments_count = comments_count + 1
-            WHERE id=? AND status='active'
-            """,
-            (int(post_id),),
-        )
 
         con.commit()
     finally:
@@ -689,7 +700,6 @@ def add_empathy(post_id: int, req: EmpathyReq):
                 (int(post_id), user_id, now),
             )
         except sqlite3.IntegrityError:
-            # כבר שם לב
             cur.execute("SELECT empathy_count FROM forum_posts WHERE id=?", (int(post_id),))
             row = cur.fetchone()
             return {"ok": True, "already": True, "empathy_count": int(row["empathy_count"]) if row else None}
@@ -756,21 +766,6 @@ def delete_comment(comment_id: int, user_id: str):
     try:
         cur = con.cursor()
 
-        # נביא את post_id כדי להפחית comments_count
-        cur.execute(
-            """
-            SELECT post_id
-            FROM forum_comments
-            WHERE id=? AND user_id=? AND status='active'
-            """,
-            (int(comment_id), user_id),
-        )
-        row = cur.fetchone()
-        if not row:
-            return {"ok": False, "error": "לא נמצא / לא שלך / כבר נמחק"}
-
-        post_id = int(row["post_id"])
-
         cur.execute(
             """
             UPDATE forum_comments
@@ -780,15 +775,8 @@ def delete_comment(comment_id: int, user_id: str):
             (int(comment_id), user_id),
         )
 
-        # הפחתת comments_count (לא יורד מתחת ל-0)
-        cur.execute(
-            """
-            UPDATE forum_posts
-            SET comments_count = CASE WHEN comments_count > 0 THEN comments_count - 1 ELSE 0 END
-            WHERE id=? AND status='active'
-            """,
-            (int(post_id),),
-        )
+        if cur.rowcount == 0:
+            return {"ok": False, "error": "לא נמצא / לא שלך / כבר נמחק"}
 
         con.commit()
         return {"ok": True}
