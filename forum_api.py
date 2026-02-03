@@ -567,26 +567,37 @@ def add_comment(post_id: int, req: CreateCommentReq):
         con.close()
 
     # --- Notifications + Push (best-effort) ---
-    owner_user_id = _get_post_owner(int(post_id))
+        owner_user_id = _get_post_owner(int(post_id))
     if owner_user_id and owner_user_id != user_id:
-        try:
-            _create_notification_for_comment(
-                owner_user_id=owner_user_id,
-                from_user_id=user_id,
-                post_id=int(post_id),
-                comment_id=int(comment_id),
-            )
+        print(
+            f"[PUSH_DEBUG] post_id={post_id} owner_user_id={owner_user_id} commenter_user_id={user_id}"
+        )
 
-            tokens = _get_user_push_tokens(owner_user_id)
-            if tokens:
-                _send_expo_push(
-                    tokens=tokens,
-                    title="תגובה חדשה לפוסט שלך",
-                    body=content,
-                    data={"screen": "ForumPost", "postId": int(post_id), "commentId": int(comment_id)},
-                )
-        except Exception:
-            pass
+        # 1) צור Notification ב-DB
+        nid, ts = _create_notification_for_comment(
+            owner_user_id=owner_user_id,
+            from_user_id=user_id,
+            post_id=int(post_id),
+            comment_id=int(comment_id),
+        )
+        print(f"[PUSH_DEBUG] created_notification_id={nid} created_at={ts}")
+
+        # 2) שלוף tokens של יוצר הפוסט
+        tokens = _get_user_push_tokens(owner_user_id)
+        print(f"[PUSH_DEBUG] owner_tokens_count={len(tokens)} tokens={tokens}")
+
+        # 3) שלח push (גם אם אין tokens – נדע בלוג)
+        resp = _send_expo_push(
+            tokens=tokens,
+            title="תגובה חדשה לפוסט שלך",
+            body=content,
+            data={"screen": "ForumPost", "postId": int(post_id), "commentId": int(comment_id)},
+        )
+        print(f"[PUSH_DEBUG] expo_resp={resp}")
+    else:
+        print(
+            f"[PUSH_DEBUG] skip_push post_id={post_id} owner_user_id={owner_user_id} commenter_user_id={user_id}"
+        )
 
     return {
         "ok": True,
@@ -599,6 +610,7 @@ def add_comment(post_id: int, req: CreateCommentReq):
             "created_at": now,
         },
     }
+
 
 
 @router.get("/posts/{post_id}/comments")
