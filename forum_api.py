@@ -9,7 +9,7 @@ from pydantic import BaseModel
 DB_PATH = "rag.db"
 
 router = APIRouter(prefix="/forum", tags=["forum"])
-FORUM_API_VERSION = "render-check-2026-02-02-22-30"
+FORUM_API_VERSION = "render-check-2026-02-03-pushdebug"
 
 @router.get("/__version")
 def forum_version():
