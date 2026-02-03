@@ -787,3 +787,9 @@ def delete_comment(comment_id: int, user_id: str):
         return {"ok": True}
     finally:
         con.close()
+
+
+
+@router.get("/debug/push-tokens")
+def debug_push_tokens(user_id: str):
+    return {"ok": True, "user_id": user_id, "tokens": _get_user_push_tokens(user_id)}
