@@ -689,6 +689,28 @@ def health():
         "rag_ready": RAG_READY,
     }
 
+@app.get("/debug/tables")
+def debug_tables():
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+    tables = [r[0] for r in cur.fetchall()]
+    con.close()
+
+    wanted = [
+        "postpartum_profiles",
+        "daily_support_messages",
+        "daily_support_delivery_log",
+    ]
+
+    return {
+        "ok": True,
+        "has": {t: (t in tables) for t in wanted},
+        "tables_count": len(tables),
+    }
+
+
+
 @app.post("/reload_rag")
 def reload_rag():
     load_rag_to_memory()
