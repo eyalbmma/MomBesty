@@ -1,5 +1,7 @@
 import time
 import sqlite3
+from push_utils import send_expo_push
+
 from typing import Optional, List, Any
 
 import requests
@@ -26,9 +28,7 @@ MIN_POST_LEN = 20
 MAX_COMMENT_LEN = 400
 MIN_COMMENT_LEN = 5
 
-# ---- Push / notifications ----
-EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
-MAX_PUSH_BODY_CHARS = 140
+
 
 
 # ---------------- DB helpers ----------------
@@ -81,14 +81,10 @@ class MarkReadReq(BaseModel):
 
 
 # ---------------- Utilities ----------------
-def _clip(s: str, n: int) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else s[:n] + "…"
 
 
-def _is_expo_token(token: str) -> bool:
-    t = (token or "").strip()
-    return t.startswith("ExponentPushToken[") or t.startswith("ExpoPushToken[")
+
+
 
 
 # ---------------- Rate limit helper ----------------
@@ -175,32 +171,6 @@ def _get_user_push_tokens(user_id: str) -> List[str]:
         con.close()
 
 
-def _send_expo_push(tokens: List[str], title: str, body: str, data: dict):
-    """
-    שליחה דרך Expo Push Service.
-    - לא מפיל את הבקשה אם נכשל (best-effort).
-    """
-    tokens = [t for t in (tokens or []) if _is_expo_token(t)]
-    if not tokens:
-        return {"ok": True, "sent": 0}
-
-    payload = []
-    for t in tokens:
-        payload.append(
-            {
-                "to": t,
-                "title": title,
-                "body": _clip(body, MAX_PUSH_BODY_CHARS),
-                "data": data or {},
-                "sound": "default",
-            }
-        )
-
-    try:
-        resp = requests.post(EXPO_PUSH_URL, json=payload, timeout=8)
-        return {"ok": True, "sent": len(tokens), "status": resp.status_code}
-    except Exception:
-        return {"ok": False, "sent": 0}
 
 
 # ---------------- Notifications ----------------
@@ -587,11 +557,11 @@ def add_comment(post_id: int, req: CreateCommentReq):
         print(f"[PUSH_DEBUG] owner_tokens_count={len(tokens)} tokens={tokens}")
 
         # 3) שלח push (גם אם אין tokens – נדע בלוג)
-        resp = _send_expo_push(
-            tokens=tokens,
-            title="תגובה חדשה לפוסט שלך",
-            body=content,
-            data={"screen": "ForumPost", "postId": int(post_id), "commentId": int(comment_id)},
+        resp = send_expo_push(
+        tokens=tokens,
+        title="תגובה חדשה לפוסט שלך",
+        body=content,
+        data={"screen": "ForumPost", "postId": int(post_id), "commentId": int(comment_id)},
         )
         print(f"[PUSH_DEBUG] expo_resp={resp}")
     else:

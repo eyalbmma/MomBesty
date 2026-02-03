@@ -268,6 +268,47 @@ def ensure_tables():
         ON forum_notifications(post_id, created_at);
     """)
 
+
+
+    # =========================================================
+        # Daily postpartum support (NEW)
+        # =========================================================
+    cur.execute("""
+            CREATE TABLE IF NOT EXISTS postpartum_profiles (
+                user_id TEXT PRIMARY KEY,
+                postpartum_start_ts INTEGER,
+                opt_in INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+        """)
+
+    cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_support_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                interaction_hint TEXT,
+                stage TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+        """)
+
+    cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_support_delivery_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                day_index INTEGER NOT NULL,
+                message_id INTEGER,
+                sent_at INTEGER NOT NULL,
+                UNIQUE(user_id, day_index)
+            );
+        """)
+
+
+
+
+
     con.commit()
     con.close()
 
