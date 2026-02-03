@@ -7,7 +7,7 @@ import re
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -58,6 +58,9 @@ from tracker_api import router as tracker_router
 app.include_router(forum_router)
 app.include_router(content_router)
 app.include_router(tracker_router)
+
+# daily support runner (server-side)
+from daily_support_sender import run_daily_support
 
 # =========================
 # CORS
@@ -173,7 +176,8 @@ def column_exists(table: str, col: str) -> bool:
 
 def ensure_tables():
     """
-    יוצר טבלאות מערכת (cache / conversations) + טבלאות התראות לפורום.
+    יוצר טבלאות מערכת (cache / conversations) + טבלאות התראות לפורום +
+    טבלאות daily support.
     חשוב במיוחד ב-Render כי rag.db יכול להגיע מ-Drive בלי הטבלאות החדשות.
     """
     con = db_connect()
@@ -223,10 +227,8 @@ def ensure_tables():
     """)
 
     # =========================================================
-    # Forum notifications + push tokens (NEW)
+    # Forum notifications + push tokens
     # =========================================================
-
-    # Expo Push tokens per user/device
     cur.execute("""
         CREATE TABLE IF NOT EXISTS forum_push_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,7 +246,6 @@ def ensure_tables():
         ON forum_push_tokens(user_id);
     """)
 
-    # Notifications table (badge = count unread where read_at is NULL)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS forum_notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,46 +269,40 @@ def ensure_tables():
         ON forum_notifications(post_id, created_at);
     """)
 
-
-
     # =========================================================
-        # Daily postpartum support (NEW)
-        # =========================================================
+    # Daily postpartum support
+    # =========================================================
     cur.execute("""
-            CREATE TABLE IF NOT EXISTS postpartum_profiles (
-                user_id TEXT PRIMARY KEY,
-                postpartum_start_ts INTEGER,
-                opt_in INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-        """)
-
-    cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_support_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                day_index INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                interaction_hint TEXT,
-                stage TEXT,
-                is_active INTEGER NOT NULL DEFAULT 1
-            );
-        """)
+        CREATE TABLE IF NOT EXISTS postpartum_profiles (
+            user_id TEXT PRIMARY KEY,
+            postpartum_start_ts INTEGER,
+            opt_in INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    """)
 
     cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_support_delivery_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                day_index INTEGER NOT NULL,
-                message_id INTEGER,
-                sent_at INTEGER NOT NULL,
-                UNIQUE(user_id, day_index)
-            );
-        """)
+        CREATE TABLE IF NOT EXISTS daily_support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            interaction_hint TEXT,
+            stage TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1
+        );
+    """)
 
-
-
-
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_support_delivery_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            day_index INTEGER NOT NULL,
+            message_id INTEGER,
+            sent_at INTEGER NOT NULL,
+            UNIQUE(user_id, day_index)
+        );
+    """)
 
     con.commit()
     con.close()
@@ -574,9 +569,6 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
     return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
 
 def topic_from_history(history: List[Tuple[str, str]]) -> str:
-    """
-    מפיק 'נושא' מההקשר הקודם כדי שפולבאק בשאלת המשך יהיה רלוונטי.
-    """
     blob = " ".join([norm_q(c) for _, c in history[-HISTORY_LIMIT_TO_GPT:]])
     if any(w in blob for w in ["הנקה", "שד", "פטמה", "סדק", "פטמות", "breast", "breastfeeding"]):
         return "breastfeeding"
@@ -589,9 +581,6 @@ def topic_from_history(history: List[Tuple[str, str]]) -> str:
     return "generic"
 
 def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> str:
-    """
-    פולבאק לשאלת המשך קצרה: נשען על נושא ההיסטוריה (ולא רק על השאלה הנוכחית).
-    """
     t = topic_from_history(history)
     if t == "breastfeeding":
         return "זה נשמע בהמשך להנקה/פטמות. כדי לדייק: את מחפשת משחה לפטמות פצועות או משהו למניעה? (מילה אחת: פצועות/מניעה)"
@@ -607,7 +596,6 @@ def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> st
 # Fast-cache classifier
 # =========================
 def is_factual_question(question: str, top_score: float, history: List[Tuple[str, str]]) -> bool:
-    # שאלות "ידע/עובדות" אפשר לקאש גם בתוך שיחה
     if top_score < FAST_CACHE_SCORE_MIN:
         return False
 
@@ -629,23 +617,16 @@ def is_followup_question(question: str, history: List[Tuple[str, str]]) -> bool:
     if not qn:
         return False
 
-    # קצר = לרוב המשך
     if len(qn.split()) <= 5:
         return True
 
-    # פתיחים אופייניים לשאלת המשך
     starters = ["איזה", "מה", "איך", "כמה", "איפה", "זה", "כזו", "כזה", "אפשר"]
     return any(qn.startswith(s) for s in starters)
 
 def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> str:
-    """
-    אם זו שאלת המשך קצרה – נחזק Retrieval ע"י הוספת שורת הקשר קצרה מה-user הקודם.
-    (מעלה score לשאלות קצרות כמו 'איזה משחה יש לפטמות')
-    """
     if not is_followup_question(question, history):
         return question
 
-    # מצא את הודעת ה-user האחרונה מההיסטוריה (לפני השאלה הנוכחית)
     prev_user = ""
     for role, content in reversed(history):
         if role == "user" and content:
@@ -655,7 +636,6 @@ def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> s
     if not prev_user:
         return question
 
-    # הקשר + שאלה נוכחית
     return f"הקשר: {clip(prev_user, 220)}\nשאלה: {question}"
 
 # =========================
@@ -709,7 +689,89 @@ def debug_tables():
         "tables_count": len(tables),
     }
 
+@app.post("/debug/daily-support")
+def debug_daily_support(
+    action: str,
+    user_id: Optional[str] = None,
+    dry_run: bool = True,
+):
+    """
+    Single debug endpoint for daily support.
+    Actions:
+      - recent_token_users
+      - seed_minimal_messages
+      - create_test_user   (requires user_id)
+      - preview            (dry_run enforced)
+      - send_now           (set dry_run=false to actually send)
+    """
+    con = db_connect()
+    cur = con.cursor()
+    ts = int(time.time())
 
+    try:
+        if action == "recent_token_users":
+            cur.execute(
+                """
+                SELECT user_id, COUNT(*) AS tokens
+                FROM forum_push_tokens
+                GROUP BY user_id
+                ORDER BY MAX(last_seen_at) DESC, MAX(created_at) DESC
+                LIMIT 20
+                """
+            )
+            rows = cur.fetchall()
+            return {
+                "ok": True,
+                "users": [{"user_id": r["user_id"], "tokens": int(r["tokens"])} for r in rows],
+            }
+
+        if action == "seed_minimal_messages":
+            cur.execute("SELECT COUNT(*) AS c FROM daily_support_messages")
+            c = int(cur.fetchone()["c"])
+            if c == 0:
+                cur.executemany(
+                    """
+                    INSERT INTO daily_support_messages (day_index, text, interaction_hint, stage, is_active)
+                    VALUES (?, ?, ?, ?, 1)
+                    """,
+                    [
+                        (1, "היום, תני לעצמך רגע אחד קטן של נשימה. את עושה המון.", "נשימה קצרה", "early"),
+                        (2, "אם היום קשה—זה לא אומר שאת לא טובה. זה אומר שאת אנושית.", "חמלה עצמית", "early"),
+                        (3, "נסי לבקש עזרה בדבר אחד קטן. לא חייבים לבד.", "לבקש עזרה", "early"),
+                    ],
+                )
+                con.commit()
+                return {"ok": True, "seeded": True, "count_added": 3}
+            return {"ok": True, "seeded": False, "existing_count": c}
+
+        if action == "create_test_user":
+            if not user_id:
+                raise HTTPException(status_code=400, detail="user_id is required for create_test_user")
+
+            cur.execute(
+                """
+                INSERT INTO postpartum_profiles (user_id, postpartum_start_ts, opt_in, created_at, updated_at)
+                VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    postpartum_start_ts = excluded.postpartum_start_ts,
+                    opt_in = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, ts - 86400, ts, ts),
+            )
+            con.commit()
+            return {"ok": True, "user_id": user_id, "postpartum_day_index": 1}
+
+        if action == "preview":
+            return run_daily_support(con, dry_run=True)
+
+        if action == "send_now":
+            return run_daily_support(con, dry_run=bool(dry_run))
+
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+    finally:
+        con.close()
 
 @app.post("/reload_rag")
 def reload_rag():
@@ -747,7 +809,6 @@ def ask(req: AskReq):
 def ask_final(req: AskReq):
     t = Timer()
 
-    # 0) שימור שיחה + שליפת היסטוריה (חשוב: BEFORE שמירת השאלה הנוכחית)
     history: List[Tuple[str, str]] = []
     if req.user_id and req.conversation_id:
         upsert_conversation(req.user_id, req.conversation_id)
@@ -756,19 +817,15 @@ def ask_final(req: AskReq):
         history = get_recent_messages(req.conversation_id, limit=HISTORY_LIMIT_DB)
         t.mark("history_ms")
 
-    # עכשיו שומרים את השאלה הנוכחית (כדי שההיסטוריה ששימשה להחלטות לא תכלול אותה)
     if req.conversation_id:
         add_message(req.conversation_id, "user", req.question)
 
-    # האם זו שאלת המשך?
     followup = is_followup_question(req.question, history)
 
-    # 1) Embedding (עם שאלה מוגברת ל-Retrieval אם זו שאלת המשך קצרה)
     q_for_retrieval = build_augmented_question(req.question, history)
     qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
-    # 2) Retrieval
     top = retrieve_top_k(qv, q_for_retrieval, req.k)
     t.mark("retrieve_ms")
 
@@ -786,8 +843,6 @@ def ask_final(req: AskReq):
 
     top_score = float(top[0][0])
 
-    # Guardrail:
-    # - אם ציון ממש נמוך: לא מריצים GPT, אבל אם זה follow-up מחזירים פולבאק לפי היסטוריה
     if top_score < FOLLOWUP_HARD_FLOOR:
         ans = topic_fallback_followup(req.question, history) if followup else topic_fallback(req.question, top)
         return {
@@ -802,7 +857,6 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # - אם מתחת ל-SOFT_CUTOFF: נחסום רק אם זה לא follow-up
     if top_score < SOFT_CUTOFF and not followup:
         return {
             "answer": topic_fallback(req.question, top),
@@ -829,7 +883,6 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # Cache keys
     top_ids = [rid for (_, rid, *_r) in top]
 
     use_fast = is_factual_question(req.question, top_score, history)
@@ -856,7 +909,6 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # DB-only (רק אם לא בפיילוט)
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
         _, rid, qq, aa, source, tags, base = top[0]
         return {
@@ -871,7 +923,6 @@ def ask_final(req: AskReq):
             "timing": t.snapshot(),
         }
 
-    # Build context (CLIPPED)
     context = "\n\n".join(
         [
             f"ידע {i+1} (score={score:.3f}, tags={tags}):\n"
@@ -882,7 +933,6 @@ def ask_final(req: AskReq):
     )
     t.mark("build_context_ms")
 
-    # History (SHORT) - לא שולחים היסטוריה ל-GPT עבור FAST
     history_text = ""
     if history and not use_fast:
         lines = []
@@ -892,7 +942,6 @@ def ask_final(req: AskReq):
         history_text = "\n".join(lines)
     t.mark("build_history_ms")
 
-    # Prompts (SHORT + controlled empathy)
     system = (
         "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה וקצרה.\n"
         "חוקים: אל תאבחני. הסתמכי על מידע מהמאגר בלבד. אם חסר מידע—שאלה אחת קצרה.\n"
@@ -920,7 +969,6 @@ def ask_final(req: AskReq):
 
     final_answer = resp.choices[0].message.content or ""
 
-    # שומרים תשובת עוזרת לשיחה
     if req.conversation_id:
         add_message(req.conversation_id, "assistant", final_answer)
 
