@@ -110,6 +110,12 @@ class AskReq(BaseModel):
     topic: Optional[str] = None
 
 
+
+class EnsurePostpartumProfileReq(BaseModel):
+    user_id: str
+    postpartum_start_ts: Optional[int] = None
+
+
 # =========================
 # Timing utilities
 # =========================
@@ -724,6 +730,82 @@ ensure_rag_db()
 ensure_tables()
 load_rag_to_memory()
 
+
+
+@app.post("/postpartum/profile/ensure")
+def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
+    if not req.user_id or not req.user_id.strip():
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    now_ts = int(time.time())
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # בדיקה אם כבר קיים פרופיל
+    cur.execute(
+        "SELECT user_id, postpartum_start_ts, opt_in FROM postpartum_profiles WHERE user_id = ?",
+        (req.user_id,),
+    )
+    row = cur.fetchone()
+
+    if row is None:
+        # יצירה ראשונית בלבד
+        start_ts = req.postpartum_start_ts or now_ts
+
+        cur.execute(
+            """
+            INSERT INTO postpartum_profiles (
+                user_id,
+                postpartum_start_ts,
+                opt_in,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 1, ?, ?)
+            """,
+            (req.user_id, start_ts, now_ts, now_ts),
+        )
+        con.commit()
+        con.close()
+
+        return {
+            "ok": True,
+            "created": True,
+            "user_id": req.user_id,
+            "postpartum_start_ts": start_ts,
+        }
+
+    # קיים – no side effects
+    # מעדכנים updated_at בלבד, ו־start_ts רק אם נשלח במפורש
+    if req.postpartum_start_ts is not None:
+        cur.execute(
+            """
+            UPDATE postpartum_profiles
+            SET postpartum_start_ts = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (req.postpartum_start_ts, now_ts, req.user_id),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE postpartum_profiles
+            SET updated_at = ?
+            WHERE user_id = ?
+            """,
+            (now_ts, req.user_id),
+        )
+
+    con.commit()
+    con.close()
+
+    return {
+        "ok": True,
+        "created": False,
+        "user_id": req.user_id,
+        "opt_in": row["opt_in"],
+    }
 
 # =========================
 # Daily support admin/run endpoint
