@@ -87,6 +87,16 @@ def options_ask_final():
 @app.options("/ask")
 def options_ask():
     return Response(status_code=200)
+from daily_support_sender import run_daily_support
+
+@app.post("/admin/daily-support/run")
+def admin_run_daily_support(dry_run: bool = True, limit: int = 50):
+    con = db_connect()
+    try:
+        out = run_daily_support(con, dry_run=dry_run, limit=limit)
+        return out
+    finally:
+        con.close()
 
 @app.options("/reload_rag")
 def options_reload_rag():
