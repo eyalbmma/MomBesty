@@ -123,6 +123,7 @@ def upsert_push_token(req: PushTokenReq):
     token = (req.token or "").strip()
     platform = (req.platform or "").strip() or None
     now = now_ts()
+    print(f"[PUSH_TOKEN] user_id={user_id} platform={platform} token_prefix={token[:25]} len={len(token)}")
 
     if not user_id:
         return {"ok": False, "error": "user_id חסר"}
@@ -155,7 +156,7 @@ def upsert_push_token(req: PushTokenReq):
         )
 
         con.commit()
-        return {"ok": True}
+        return {"ok": True, "saved": True, "user_id": user_id, "platform": platform, "token_prefix": token[:25]}
     finally:
         con.close()
 
