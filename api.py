@@ -4,7 +4,7 @@ import sqlite3
 import time
 import hashlib
 import re
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 from fastapi import FastAPI, Response, HTTPException
@@ -45,22 +45,25 @@ TEMPERATURE = 0.3
 FAST_CACHE_SCORE_MIN = 0.72
 
 # ---- Follow-up tuning ----
-FOLLOWUP_HARD_FLOOR = 0.25    # מתחת לזה גם ב-follow-up לא נריץ GPT, אלא נשאל הבהרה חכמה
+FOLLOWUP_HARD_FLOOR = 0.25  # מתחת לזה גם ב-follow-up לא נריץ GPT
 # ----------------------
 
+# =========================
+# App + Routers
+# =========================
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
 
-from forum_api import router as forum_router
-from content_api import router as content_router
-from tracker_api import router as tracker_router
+from forum_api import router as forum_router  # noqa: E402
+from content_api import router as content_router  # noqa: E402
+from tracker_api import router as tracker_router  # noqa: E402
 
 app.include_router(forum_router)
 app.include_router(content_router)
 app.include_router(tracker_router)
 
 # daily support runner (server-side)
-from daily_support_sender import run_daily_support
+from daily_support_sender import run_daily_support  # noqa: E402
 
 # =========================
 # CORS
@@ -80,27 +83,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.options("/ask_final")
 def options_ask_final():
     return Response(status_code=200)
 
+
 @app.options("/ask")
 def options_ask():
     return Response(status_code=200)
-from daily_support_sender import run_daily_support
 
-@app.post("/admin/daily-support/run")
-def admin_run_daily_support(dry_run: bool = True, limit: int = 50):
-    con = db_connect()
-    try:
-        out = run_daily_support(con, dry_run=dry_run, limit=limit)
-        return out
-    finally:
-        con.close()
 
 @app.options("/reload_rag")
 def options_reload_rag():
     return Response(status_code=200)
+
 
 # =========================
 # Models
@@ -112,11 +109,13 @@ class AskReq(BaseModel):
     conversation_id: Optional[str] = None
     topic: Optional[str] = None
 
+
 # =========================
 # Timing utilities
 # =========================
 def now_ms() -> int:
     return int(time.perf_counter() * 1000)
+
 
 class Timer:
     def __init__(self):
@@ -131,6 +130,7 @@ class Timer:
         out["total_ms"] = now_ms() - self.t0
         return out
 
+
 # =========================
 # Text normalization
 # =========================
@@ -140,13 +140,16 @@ def norm_q(s: str) -> str:
     s = re.sub(r"[^0-9a-zA-Zא-ת\s]", "", s)
     return s
 
+
 def tokenize_he(s: str) -> List[str]:
     s = norm_q(s)
     return [t for t in s.split(" ") if len(t) >= 3]
 
+
 def clip(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n] + "…"
+
 
 # =========================
 # Ensure rag.db exists (download from Drive if missing)
@@ -161,10 +164,12 @@ def ensure_rag_db():
         raise RuntimeError("Missing RAG_DB_FILE_ID env var")
 
     print("Downloading rag.db from Google Drive via gdown...")
-    import gdown
+    import gdown  # type: ignore
+
     url = f"https://drive.google.com/uc?id={file_id}"
     gdown.download(url, DB_PATH, quiet=False)
     print("Downloaded rag.db size:", os.path.getsize(DB_PATH))
+
 
 # =========================
 # SQLite helpers
@@ -173,6 +178,7 @@ def db_connect():
     con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
+
 
 def column_exists(table: str, col: str) -> bool:
     con = db_connect()
@@ -184,6 +190,7 @@ def column_exists(table: str, col: str) -> bool:
     finally:
         con.close()
 
+
 def ensure_tables():
     """
     יוצר טבלאות מערכת (cache / conversations) + טבלאות התראות לפורום +
@@ -194,34 +201,41 @@ def ensure_tables():
     cur = con.cursor()
 
     # ---- LLM cache ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS llm_cache (
             cache_key TEXT PRIMARY KEY,
             answer TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
 
     # ---- Embedding cache ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS emb_cache (
             q_norm TEXT PRIMARY KEY,
             embedding TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
 
     # ---- Conversations ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
             user_id TEXT,
             created_at INTEGER,
             updated_at INTEGER
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS conversation_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT NOT NULL,
@@ -229,17 +243,21 @@ def ensure_tables():
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_conv_msgs_conv_time
         ON conversation_messages(conversation_id, created_at);
-    """)
+        """
+    )
 
     # =========================================================
     # Forum notifications + push tokens
     # =========================================================
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS forum_push_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -249,14 +267,18 @@ def ensure_tables():
             last_seen_at INTEGER NOT NULL,
             UNIQUE(user_id, token)
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_forum_push_tokens_user
         ON forum_push_tokens(user_id);
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS forum_notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -267,22 +289,28 @@ def ensure_tables():
             created_at INTEGER NOT NULL,
             read_at INTEGER
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_read
         ON forum_notifications(user_id, read_at, created_at);
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_forum_notifications_post
         ON forum_notifications(post_id, created_at);
-    """)
+        """
+    )
 
     # =========================================================
     # Daily postpartum support
     # =========================================================
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS postpartum_profiles (
             user_id TEXT PRIMARY KEY,
             postpartum_start_ts INTEGER,
@@ -290,9 +318,11 @@ def ensure_tables():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS daily_support_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             day_index INTEGER NOT NULL,
@@ -301,9 +331,11 @@ def ensure_tables():
             stage TEXT,
             is_active INTEGER NOT NULL DEFAULT 1
         );
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS daily_support_delivery_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
@@ -312,10 +344,12 @@ def ensure_tables():
             sent_at INTEGER NOT NULL,
             UNIQUE(user_id, day_index)
         );
-    """)
+        """
+    )
 
     con.commit()
     con.close()
+
 
 def upsert_conversation(user_id: str, conversation_id: str):
     ts = int(time.time())
@@ -334,6 +368,7 @@ def upsert_conversation(user_id: str, conversation_id: str):
     con.commit()
     con.close()
 
+
 def add_message(conversation_id: str, role: str, content: str):
     ts = int(time.time())
     con = db_connect()
@@ -347,6 +382,7 @@ def add_message(conversation_id: str, role: str, content: str):
     )
     con.commit()
     con.close()
+
 
 def get_recent_messages(conversation_id: str, limit: int = 12) -> List[Tuple[str, str]]:
     con = db_connect()
@@ -365,6 +401,7 @@ def get_recent_messages(conversation_id: str, limit: int = 12) -> List[Tuple[str
     con.close()
     rows = list(reversed(rows))
     return [(r["role"] or "", r["content"] or "") for r in rows]
+
 
 # =========================
 # LLM answer cache
@@ -386,6 +423,7 @@ def make_cache_key_conversational(
     )
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
+
 def make_cache_key_fast(question: str, top_ids: List[int], k: int) -> str:
     base = (
         f"{PROMPT_VER}|FAST|{CHAT_MODEL}|k={k}"
@@ -393,6 +431,7 @@ def make_cache_key_fast(question: str, top_ids: List[int], k: int) -> str:
         f"|ids={','.join(map(str, top_ids))}"
     )
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
 
 def cache_get(key: str) -> Optional[str]:
     con = db_connect()
@@ -407,15 +446,17 @@ def cache_get(key: str) -> Optional[str]:
         return None
     return ans
 
+
 def cache_set(key: str, answer: str):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO llm_cache(cache_key, answer, created_at) VALUES(?,?,?)",
-        (key, answer, int(time.time()))
+        (key, answer, int(time.time())),
     )
     con.commit()
     con.close()
+
 
 # =========================
 # Embedding cache
@@ -436,15 +477,17 @@ def emb_cache_get(q_norm: str) -> Optional[np.ndarray]:
     except Exception:
         return None
 
+
 def emb_cache_set(q_norm: str, vec: np.ndarray):
     con = db_connect()
     cur = con.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO emb_cache(q_norm, embedding, created_at) VALUES(?,?,?)",
-        (q_norm, json.dumps(vec.tolist(), ensure_ascii=False), int(time.time()))
+        (q_norm, json.dumps(vec.tolist(), ensure_ascii=False), int(time.time())),
     )
     con.commit()
     con.close()
+
 
 def get_embedding(text: str, timing: Optional[Timer] = None) -> np.ndarray:
     qn = norm_q(text)
@@ -456,7 +499,7 @@ def get_embedding(text: str, timing: Optional[Timer] = None) -> np.ndarray:
 
     resp = client.embeddings.create(
         model=EMBED_MODEL,
-        input=[(text or "").replace("\n", " ").strip()]
+        input=[(text or "").replace("\n", " ").strip()],
     )
     v = np.array(resp.data[0].embedding, dtype=np.float32)
     emb_cache_set(qn, v)
@@ -464,12 +507,14 @@ def get_embedding(text: str, timing: Optional[Timer] = None) -> np.ndarray:
         timing.mark("embed_cache_miss_ms")
     return v
 
+
 # =========================
 # RAG in-memory
 # =========================
 RAG_ROWS: List[Tuple[int, str, str, str, str]] = []  # (id, question, answer, source, tags)
 RAG_EMBS: Optional[np.ndarray] = None
 RAG_READY: bool = False
+
 
 def load_rag_to_memory():
     global RAG_ROWS, RAG_EMBS, RAG_READY
@@ -516,6 +561,7 @@ def load_rag_to_memory():
     RAG_ROWS = local_rows
     RAG_READY = True
 
+
 def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> float:
     qn = norm_q(question)
     cn = norm_q(candidate_q)
@@ -539,6 +585,7 @@ def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> floa
 
     return 0.0
 
+
 def retrieve_top_k(qv: np.ndarray, question: str, k: int):
     if (not RAG_READY) or (RAG_EMBS is None) or (len(RAG_ROWS) == 0):
         return []
@@ -560,6 +607,7 @@ def retrieve_top_k(qv: np.ndarray, question: str, k: int):
         top.append((boosted, rid, qq, aa, source, tags, base))
     return top
 
+
 # =========================
 # Topic-aware fallback
 # =========================
@@ -567,7 +615,13 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
     qn = norm_q(question)
     tags_blob = " ".join([(m[5] or "") for m in top_matches]).lower()
 
-    if ("הנקה" in qn) or ("שד" in qn) or ("פטמה" in qn) or ("breast" in tags_blob) or ("breastfeeding" in tags_blob):
+    if (
+        ("הנקה" in qn)
+        or ("שד" in qn)
+        or ("פטמה" in qn)
+        or ("breast" in tags_blob)
+        or ("breastfeeding" in tags_blob)
+    ):
         return "כדי לדייק: בן/בת כמה התינוק, והאם יש כאב/סדקים או קושי בהיצמדות?"
 
     if ("שינה" in qn) or ("בכי" in qn) or ("אוכל" in qn) or ("האכלה" in qn):
@@ -577,6 +631,7 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
         return "כדי לדייק: יש חום/דימום שמתחזק/כאב שמתגבר? ואיזה שבוע אחרי לידה את?"
 
     return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
+
 
 def topic_from_history(history: List[Tuple[str, str]]) -> str:
     blob = " ".join([norm_q(c) for _, c in history[-HISTORY_LIMIT_TO_GPT:]])
@@ -590,6 +645,7 @@ def topic_from_history(history: List[Tuple[str, str]]) -> str:
         return "postpartum"
     return "generic"
 
+
 def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> str:
     t = topic_from_history(history)
     if t == "breastfeeding":
@@ -602,6 +658,7 @@ def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> st
         return "זה נשמע בהמשך להתאוששות אחרי לידה. כדי לדייק: כמה זמן אחרי לידה את, ומה התסמין המרכזי עכשיו?"
     return "כדי לענות מדויק, תכתבי עוד משפט אחד של הקשר: על מי מדובר ומה הקושי?"
 
+
 # =========================
 # Fast-cache classifier
 # =========================
@@ -611,10 +668,20 @@ def is_factual_question(question: str, top_score: float, history: List[Tuple[str
 
     qn = norm_q(question)
     patterns = [
-        "בן כמה", "בת כמה", "מתי", "באיזה גיל", "כמה זמן", "מתי מתחיל",
-        "מה זה", "איך נקרא", "התפתחות", "שלב", "מתי תינוק"
+        "בן כמה",
+        "בת כמה",
+        "מתי",
+        "באיזה גיל",
+        "כמה זמן",
+        "מתי מתחיל",
+        "מה זה",
+        "איך נקרא",
+        "התפתחות",
+        "שלב",
+        "מתי תינוק",
     ]
     return any(p in qn for p in patterns)
+
 
 # =========================
 # Follow-up detector
@@ -633,6 +700,7 @@ def is_followup_question(question: str, history: List[Tuple[str, str]]) -> bool:
     starters = ["איזה", "מה", "איך", "כמה", "איפה", "זה", "כזו", "כזה", "אפשר"]
     return any(qn.startswith(s) for s in starters)
 
+
 def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> str:
     if not is_followup_question(question, history):
         return question
@@ -648,6 +716,7 @@ def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> s
 
     return f"הקשר: {clip(prev_user, 220)}\nשאלה: {question}"
 
+
 # =========================
 # Init
 # =========================
@@ -655,12 +724,26 @@ ensure_rag_db()
 ensure_tables()
 load_rag_to_memory()
 
+
+# =========================
+# Daily support admin/run endpoint
+# =========================
+@app.post("/admin/daily-support/run")
+def admin_run_daily_support(dry_run: bool = True, limit: int = 50):
+    con = db_connect()
+    try:
+        return run_daily_support(con, dry_run=dry_run, limit=limit)
+    finally:
+        con.close()
+
+
 # =========================
 # Endpoints
 # =========================
 @app.get("/")
 def root():
     return {"ok": True, "version": APP_VERSION}
+
 
 @app.get("/health")
 def health():
@@ -679,6 +762,7 @@ def health():
         "rag_ready": RAG_READY,
     }
 
+
 @app.get("/debug/tables")
 def debug_tables():
     con = db_connect()
@@ -687,17 +771,14 @@ def debug_tables():
     tables = [r[0] for r in cur.fetchall()]
     con.close()
 
-    wanted = [
-        "postpartum_profiles",
-        "daily_support_messages",
-        "daily_support_delivery_log",
-    ]
+    wanted = ["postpartum_profiles", "daily_support_messages", "daily_support_delivery_log"]
 
     return {
         "ok": True,
         "has": {t: (t in tables) for t in wanted},
         "tables_count": len(tables),
     }
+
 
 @app.post("/debug/daily-support")
 def debug_daily_support(
@@ -710,9 +791,10 @@ def debug_daily_support(
     Actions:
       - recent_token_users
       - seed_minimal_messages
+      - messages_count
       - create_test_user   (requires user_id)
-      - preview            (dry_run enforced)
-      - send_now           (set dry_run=false to actually send)
+      - preview
+      - send_now           (dry_run=false to actually send)
     """
     con = db_connect()
     cur = con.cursor()
@@ -735,9 +817,11 @@ def debug_daily_support(
                 "users": [{"user_id": r["user_id"], "tokens": int(r["tokens"])} for r in rows],
             }
 
-        if action == "seed_minimal_messages":
+        elif action == "seed_minimal_messages":
             cur.execute("SELECT COUNT(*) AS c FROM daily_support_messages")
-            c = int(cur.fetchone()["c"])
+            row = cur.fetchone()
+            c = int((row["c"] if row and "c" in row.keys() else 0) or 0)
+
             if c == 0:
                 cur.executemany(
                     """
@@ -752,9 +836,35 @@ def debug_daily_support(
                 )
                 con.commit()
                 return {"ok": True, "seeded": True, "count_added": 3}
+
             return {"ok": True, "seeded": False, "existing_count": c}
 
-        if action == "create_test_user":
+        elif action == "messages_count":
+            cur.execute("SELECT COUNT(1) AS total FROM daily_support_messages WHERE is_active=1")
+            total = int((cur.fetchone()["total"] or 0))
+
+            cur.execute(
+                "SELECT COUNT(1) AS day1 FROM daily_support_messages WHERE day_index=1 AND is_active=1"
+            )
+            day1 = int((cur.fetchone()["day1"] or 0))
+
+            cur.execute(
+                "SELECT MIN(day_index) AS min_day, MAX(day_index) AS max_day "
+                "FROM daily_support_messages WHERE is_active=1"
+            )
+            row = cur.fetchone()
+            min_day = int(row["min_day"]) if row and row["min_day"] is not None else None
+            max_day = int(row["max_day"]) if row and row["max_day"] is not None else None
+
+            return {
+                "ok": True,
+                "total_active": total,
+                "day1_active": day1,
+                "min_day": min_day,
+                "max_day": max_day,
+            }
+
+        elif action == "create_test_user":
             if not user_id:
                 raise HTTPException(status_code=400, detail="user_id is required for create_test_user")
 
@@ -772,10 +882,10 @@ def debug_daily_support(
             con.commit()
             return {"ok": True, "user_id": user_id, "postpartum_day_index": 1}
 
-        if action == "preview":
+        elif action == "preview":
             return run_daily_support(con, dry_run=True)
 
-        if action == "send_now":
+        elif action == "send_now":
             return run_daily_support(con, dry_run=bool(dry_run))
 
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
@@ -783,10 +893,12 @@ def debug_daily_support(
     finally:
         con.close()
 
+
 @app.post("/reload_rag")
 def reload_rag():
     load_rag_to_memory()
     return {"ok": True, "rag_rows_loaded": len(RAG_ROWS), "rag_ready": RAG_READY}
+
 
 @app.post("/ask")
 def ask(req: AskReq):
@@ -815,6 +927,7 @@ def ask(req: AskReq):
         "timing": t.snapshot(),
     }
 
+
 @app.post("/ask_final")
 def ask_final(req: AskReq):
     t = Timer()
@@ -840,7 +953,11 @@ def ask_final(req: AskReq):
     t.mark("retrieve_ms")
 
     if not top:
-        ans = topic_fallback_followup(req.question, history) if followup else "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?"
+        ans = (
+            topic_fallback_followup(req.question, history)
+            if followup
+            else "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?"
+        )
         return {
             "answer": ans,
             "cached": False,
@@ -862,8 +979,10 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                            for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [
+                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                for (s, rid, *_r, _source, tags, base) in top
+            ],
             "timing": t.snapshot(),
         }
 
@@ -875,8 +994,10 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                            for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [
+                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                for (s, rid, *_r, _source, tags, base) in top
+            ],
             "timing": t.snapshot(),
         }
 
@@ -888,8 +1009,10 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                            for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [
+                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                for (s, rid, *_r, _source, tags, base) in top
+            ],
             "timing": t.snapshot(),
         }
 
@@ -914,13 +1037,15 @@ def ask_final(req: AskReq):
             "cache_type": cache_type,
             "followup": followup,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                            for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [
+                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                for (s, rid, *_r, _source, tags, base) in top
+            ],
             "timing": t.snapshot(),
         }
 
     if (not PILOT_MODE) and (top_score >= TOP_SCORE_THRESHOLD):
-        _, rid, qq, aa, source, tags, base = top[0]
+        _, _rid, _qq, aa, _source, _tags, _base = top[0]
         return {
             "answer": aa,
             "cached": False,
@@ -928,8 +1053,10 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
-            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                            for (s, rid, *_r, _source, tags, base) in top],
+            "top_matches": [
+                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+                for (s, rid, *_r, _source, tags, base) in top
+            ],
             "timing": t.snapshot(),
         }
 
@@ -992,7 +1119,9 @@ def ask_final(req: AskReq):
         "cache_type": cache_type,
         "followup": followup,
         "top_score": round(top_score, 4),
-        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                        for (s, rid, *_r, _source, tags, base) in top],
+        "top_matches": [
+            {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
+            for (s, rid, *_r, _source, tags, base) in top
+        ],
         "timing": t.snapshot(),
     }
