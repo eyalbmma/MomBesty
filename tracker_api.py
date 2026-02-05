@@ -20,7 +20,7 @@ def now_ts() -> int:
     return int(time.time())
 
 
-EntryType = Literal["feed", "diaper", "sleep"]
+EntryType = Literal["feed", "diaper", "sleep", "breastfeed", "pump", "medicine", "vaccine", "bath"]
 
 
 class EntryCreate(BaseModel):
