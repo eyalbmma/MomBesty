@@ -5,7 +5,7 @@ from typing import Optional, List, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-DB_PATH = "rag.db"
+DB_PATH = "/data/rag.db"
 
 router = APIRouter(prefix="/tracker", tags=["tracker"])
 

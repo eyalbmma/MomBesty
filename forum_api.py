@@ -8,7 +8,7 @@ import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-DB_PATH = "rag.db"
+DB_PATH = "/data/rag.db"
 
 router = APIRouter(prefix="/forum", tags=["forum"])
 FORUM_API_VERSION = "render-check-2026-02-03-pushdebug"
