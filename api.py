@@ -1417,11 +1417,14 @@ def ask_final(req: AskReq):
     t.mark("embed_ms")
 
     # Tiered retrieval: authoritative first
-    top = retrieve_top_k(qv, q_for_retrieval, req.k, tier="authoritative")
+    k_auth = max(req.k, 6)  # מחפשים יותר רחב במאגר המוסמך
+    top = retrieve_top_k(qv, q_for_retrieval, k_auth, tier="authoritative")
     tier_used = "authoritative"
+
     if not top:
         top = retrieve_top_k(qv, q_for_retrieval, req.k, tier="community")
         tier_used = "community"
+
 
     t.mark("retrieve_ms")
 
