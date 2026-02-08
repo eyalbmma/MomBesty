@@ -17,7 +17,7 @@ from openai import OpenAI
 # =========================
 APP_VERSION = "render-test-11-followup-context"
 
-DB_PATH = "rag.db"
+DB_PATH = "/data/rag.db"
 TABLE = "rag_clean"
 EMB_COL = "embedding"
 
@@ -57,10 +57,12 @@ app = FastAPI()
 from forum_api import router as forum_router  # noqa: E402
 from content_api import router as content_router  # noqa: E402
 from tracker_api import router as tracker_router  # noqa: E402
+from circles_api import router as circles_router  # noqa: E402
 
 app.include_router(forum_router)
 app.include_router(content_router)
 app.include_router(tracker_router)
+app.include_router(circles_router)
 
 # daily support runner (server-side)
 from daily_support_sender import run_daily_support  # noqa: E402
@@ -352,6 +354,125 @@ def ensure_tables():
         );
         """
     )
+
+
+      # =========================================================
+    # Circles Hub (Pros / Groups / Events / Areas)
+    # =========================================================
+
+    # ---- Areas ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_areas (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            order_index INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_circles_areas_order
+        ON circles_areas(order_index);
+    """)
+
+    # ---- Pros ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_pros (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            short_bio TEXT,
+            is_online INTEGER NOT NULL DEFAULT 0,
+            is_in_person INTEGER NOT NULL DEFAULT 1,
+            phone_whatsapp TEXT,
+            website_url TEXT,
+            instagram_url TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_pros_active ON circles_pros(is_active);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_pros_name ON circles_pros(name);")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_pro_categories (
+            pro_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            PRIMARY KEY(pro_id, category)
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_circles_pro_categories_cat
+        ON circles_pro_categories(category);
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_pro_areas (
+            pro_id TEXT NOT NULL,
+            area_id TEXT NOT NULL,
+            PRIMARY KEY(pro_id, area_id)
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_circles_pro_areas_area
+        ON circles_pro_areas(area_id);
+    """)
+
+    # ---- Groups ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            join_url TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_groups_active ON circles_groups(is_active);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_groups_name ON circles_groups(name);")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_group_areas (
+            group_id TEXT NOT NULL,
+            area_id TEXT NOT NULL,
+            PRIMARY KEY(group_id, area_id)
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_circles_group_areas_area
+        ON circles_group_areas(area_id);
+    """)
+
+    # ---- Events ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_events (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            starts_at INTEGER NOT NULL,  -- unix ts seconds
+            description TEXT,
+            signup_url TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_events_active ON circles_events(is_active);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_events_starts ON circles_events(starts_at);")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS circles_event_areas (
+            event_id TEXT NOT NULL,
+            area_id TEXT NOT NULL,
+            PRIMARY KEY(event_id, area_id)
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_circles_event_areas_area
+        ON circles_event_areas(area_id);
+    """)
+
+
+
 
     con.commit()
     con.close()
