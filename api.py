@@ -79,9 +79,10 @@ app.add_middleware(
         "http://localhost:19006",
         "http://127.0.0.1:19006",
         "http://192.168.1.144:8081",
-        "https://stellar-snickerdoodle-d86956.netlify.app",
+       
     ],
-    allow_credentials=True,
+     allow_origin_regex=r"^https://.*\.netlify\.app$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
