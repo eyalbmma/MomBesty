@@ -207,6 +207,91 @@ def ensure_tables():
     con = db_connect()
     cur = con.cursor()
 
+
+
+
+
+def ensure_source_tier():
+    """
+    Ensures rag_clean.source_tier exists and is populated.
+    Safe: won't break startup if DB is read-only; will fallback gracefully.
+    """
+    try:
+        has_source_tier = column_exists(TABLE, "source_tier")
+
+        con = db_connect()
+        cur = con.cursor()
+
+        # 1) Add column if missing
+        if not has_source_tier:
+            try:
+                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN source_tier TEXT;")
+                con.commit()
+                has_source_tier = True
+                print("[RAG] Added column source_tier")
+            except Exception as e:
+                # If DB is read-only or ALTER not allowed, keep going
+                print("[RAG] WARNING: could not ALTER TABLE to add source_tier:", str(e))
+                con.close()
+                return
+
+        # 2) Only backfill if there are NULLs
+        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier IS NULL OR TRIM(source_tier) = ''")
+        missing = int(cur.fetchone()["c"] or 0)
+
+        if missing == 0:
+            con.close()
+            return
+
+        # 3) Mark authoritative first (based on source / tags heuristics)
+        # Adjust these patterns to match how YOUR 'source' strings look in the DB.
+        cur.execute(
+            f"""
+            UPDATE {TABLE}
+            SET source_tier='authoritative'
+            WHERE (source_tier IS NULL OR TRIM(source_tier) = '')
+              AND (
+                lower(COALESCE(source,'')) LIKE '%health.gov%' OR
+                lower(COALESCE(source,'')) LIKE '%me.health.gov%' OR
+                lower(COALESCE(source,'')) LIKE '%משרד הבריאות%' OR
+                lower(COALESCE(source,'')) LIKE '%clalit%' OR
+                lower(COALESCE(source,'')) LIKE '%maccabi%' OR
+                lower(COALESCE(source,'')) LIKE '%leumit%' OR
+                lower(COALESCE(source,'')) LIKE '%sheba%' OR
+                lower(COALESCE(source,'')) LIKE '%ichilov%' OR
+                lower(COALESCE(source,'')) LIKE '%rambam%' OR
+                lower(COALESCE(source,'')) LIKE '%assuta%' OR
+                lower(COALESCE(tags,''))  LIKE '%authoritative%' OR
+                lower(COALESCE(tags,''))  LIKE '%משרד הבריאות%'
+              );
+            """
+        )
+
+        # 4) Everything else becomes community
+        cur.execute(
+            f"""
+            UPDATE {TABLE}
+            SET source_tier='community'
+            WHERE source_tier IS NULL OR TRIM(source_tier) = '';
+            """
+        )
+
+        con.commit()
+
+        # quick log
+        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='authoritative'")
+        auth_count = int(cur.fetchone()["c"] or 0)
+        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='community'")
+        comm_count = int(cur.fetchone()["c"] or 0)
+
+        con.close()
+        print(f"[RAG] source_tier backfilled: authoritative={auth_count}, community={comm_count}")
+
+    except Exception as e:
+        # Never block server startup
+        print("[RAG] WARNING: ensure_source_tier failed:", str(e))
+        return
+
     # ---- LLM cache ----
     cur.execute(
         """
@@ -494,6 +579,14 @@ def ensure_tables():
         ON circles_event_areas(area_id);
         """
     )
+
+
+
+
+
+
+
+
 
     con.commit()
     con.close()
@@ -923,7 +1016,9 @@ def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> s
 # =========================
 ensure_rag_db()
 ensure_tables()
+ensure_source_tier()
 load_rag_to_memory()
+
 
 
 @app.post("/postpartum/profile/ensure")
