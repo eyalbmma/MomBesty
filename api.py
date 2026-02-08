@@ -112,7 +112,6 @@ class AskReq(BaseModel):
     topic: Optional[str] = None
 
 
-
 class EnsurePostpartumProfileReq(BaseModel):
     user_id: str
     postpartum_start_ts: Optional[int] = None
@@ -355,26 +354,30 @@ def ensure_tables():
         """
     )
 
-
-      # =========================================================
+    # =========================================================
     # Circles Hub (Pros / Groups / Events / Areas)
     # =========================================================
 
     # ---- Areas ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_areas (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             order_index INTEGER NOT NULL DEFAULT 0
         );
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_circles_areas_order
         ON circles_areas(order_index);
-    """)
+        """
+    )
 
     # ---- Pros ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_pros (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -388,36 +391,46 @@ def ensure_tables():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_pros_active ON circles_pros(is_active);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_pros_name ON circles_pros(name);")
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_pro_categories (
             pro_id TEXT NOT NULL,
             category TEXT NOT NULL,
             PRIMARY KEY(pro_id, category)
         );
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_circles_pro_categories_cat
         ON circles_pro_categories(category);
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_pro_areas (
             pro_id TEXT NOT NULL,
             area_id TEXT NOT NULL,
             PRIMARY KEY(pro_id, area_id)
         );
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_circles_pro_areas_area
         ON circles_pro_areas(area_id);
-    """)
+        """
+    )
 
     # ---- Groups ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_groups (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -427,24 +440,30 @@ def ensure_tables():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_groups_active ON circles_groups(is_active);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_groups_name ON circles_groups(name);")
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_group_areas (
             group_id TEXT NOT NULL,
             area_id TEXT NOT NULL,
             PRIMARY KEY(group_id, area_id)
         );
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_circles_group_areas_area
         ON circles_group_areas(area_id);
-    """)
+        """
+    )
 
     # ---- Events ----
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_events (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
@@ -455,24 +474,26 @@ def ensure_tables():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
-    """)
+        """
+    )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_events_active ON circles_events(is_active);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_circles_events_starts ON circles_events(starts_at);")
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS circles_event_areas (
             event_id TEXT NOT NULL,
             area_id TEXT NOT NULL,
             PRIMARY KEY(event_id, area_id)
         );
-    """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_circles_event_areas_area
         ON circles_event_areas(area_id);
-    """)
-
-
-
+        """
+    )
 
     con.commit()
     con.close()
@@ -636,17 +657,30 @@ def get_embedding(text: str, timing: Optional[Timer] = None) -> np.ndarray:
 
 
 # =========================
-# RAG in-memory
+# RAG in-memory (split by source_tier)
 # =========================
-RAG_ROWS: List[Tuple[int, str, str, str, str]] = []  # (id, question, answer, source, tags)
-RAG_EMBS: Optional[np.ndarray] = None
+RAG_ROWS_AUTH: List[Tuple[int, str, str, str, str]] = []
+RAG_EMBS_AUTH: Optional[np.ndarray] = None
+
+RAG_ROWS_COMM: List[Tuple[int, str, str, str, str]] = []
+RAG_EMBS_COMM: Optional[np.ndarray] = None
+
 RAG_READY: bool = False
 
 
+def _norm_mat(embs_list: List[np.ndarray]) -> Optional[np.ndarray]:
+    if not embs_list:
+        return None
+    mat = np.vstack(embs_list).astype(np.float32)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
+    return (mat / norms).astype(np.float32)
+
+
 def load_rag_to_memory():
-    global RAG_ROWS, RAG_EMBS, RAG_READY
+    global RAG_ROWS_AUTH, RAG_EMBS_AUTH, RAG_ROWS_COMM, RAG_EMBS_COMM, RAG_READY
 
     has_is_active = column_exists(TABLE, "is_active")
+    has_source_tier = column_exists(TABLE, "source_tier")
 
     where = f"{EMB_COL} IS NOT NULL AND {EMB_COL} <> ''"
     if has_is_active:
@@ -654,39 +688,68 @@ def load_rag_to_memory():
 
     con = db_connect()
     cur = con.cursor()
-    cur.execute(
-        f"SELECT id, question, answer, source, tags, {EMB_COL} "
-        f"FROM {TABLE} "
-        f"WHERE {where}"
-    )
+
+    if has_source_tier:
+        cur.execute(
+            f"SELECT id, question, answer, source, tags, source_tier, {EMB_COL} "
+            f"FROM {TABLE} "
+            f"WHERE {where}"
+        )
+    else:
+        # fallback: everything treated as community if source_tier not present
+        cur.execute(
+            f"SELECT id, question, answer, source, tags, {EMB_COL} "
+            f"FROM {TABLE} "
+            f"WHERE {where}"
+        )
+
     rows = cur.fetchall()
     con.close()
 
-    local_rows: List[Tuple[int, str, str, str, str]] = []
-    embs: List[np.ndarray] = []
+    local_rows_auth: List[Tuple[int, str, str, str, str]] = []
+    embs_auth: List[np.ndarray] = []
 
-    for rid, q, a, source, tags, emb_json in rows:
-        try:
-            ev = np.array(json.loads(emb_json), dtype=np.float32)
-        except Exception:
-            continue
-        if ev.size == 0:
-            continue
-        embs.append(ev)
-        local_rows.append((int(rid), q or "", a or "", source or "", tags or ""))
+    local_rows_comm: List[Tuple[int, str, str, str, str]] = []
+    embs_comm: List[np.ndarray] = []
 
-    if not embs:
-        RAG_ROWS = []
-        RAG_EMBS = None
-        RAG_READY = False
-        return
+    if has_source_tier:
+        for rid, q, a, source, tags, source_tier, emb_json in rows:
+            try:
+                ev = np.array(json.loads(emb_json), dtype=np.float32)
+            except Exception:
+                continue
+            if ev.size == 0:
+                continue
 
-    embs_mat = np.vstack(embs).astype(np.float32)
-    norms = np.linalg.norm(embs_mat, axis=1, keepdims=True) + 1e-12
-    RAG_EMBS = (embs_mat / norms).astype(np.float32)
+            row_pack = (int(rid), q or "", a or "", source or "", tags or "")
+            tier = (source_tier or "").strip().lower()
 
-    RAG_ROWS = local_rows
-    RAG_READY = True
+            if tier == "authoritative":
+                embs_auth.append(ev)
+                local_rows_auth.append(row_pack)
+            else:
+                embs_comm.append(ev)
+                local_rows_comm.append(row_pack)
+    else:
+        for rid, q, a, source, tags, emb_json in rows:
+            try:
+                ev = np.array(json.loads(emb_json), dtype=np.float32)
+            except Exception:
+                continue
+            if ev.size == 0:
+                continue
+
+            row_pack = (int(rid), q or "", a or "", source or "", tags or "")
+            embs_comm.append(ev)
+            local_rows_comm.append(row_pack)
+
+    RAG_EMBS_AUTH = _norm_mat(embs_auth)
+    RAG_ROWS_AUTH = local_rows_auth
+
+    RAG_EMBS_COMM = _norm_mat(embs_comm)
+    RAG_ROWS_COMM = local_rows_comm
+
+    RAG_READY = (RAG_EMBS_AUTH is not None and len(RAG_ROWS_AUTH) > 0) or (RAG_EMBS_COMM is not None and len(RAG_ROWS_COMM) > 0)
 
 
 def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> float:
@@ -713,14 +776,25 @@ def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> floa
     return 0.0
 
 
-def retrieve_top_k(qv: np.ndarray, question: str, k: int):
-    if (not RAG_READY) or (RAG_EMBS is None) or (len(RAG_ROWS) == 0):
+def retrieve_top_k(qv: np.ndarray, question: str, k: int, tier: str = "authoritative"):
+    if not RAG_READY:
+        return []
+
+    tier = (tier or "").strip().lower()
+    if tier == "authoritative":
+        rows = RAG_ROWS_AUTH
+        embs = RAG_EMBS_AUTH
+    else:
+        rows = RAG_ROWS_COMM
+        embs = RAG_EMBS_COMM
+
+    if (embs is None) or (not rows):
         return []
 
     qv = qv.astype(np.float32)
     qv = qv / (np.linalg.norm(qv) + 1e-12)
 
-    scores = RAG_EMBS @ qv
+    scores = embs @ qv
     k = max(1, min(int(k), scores.shape[0]))
 
     idx = np.argpartition(scores, -k)[-k:]
@@ -728,7 +802,7 @@ def retrieve_top_k(qv: np.ndarray, question: str, k: int):
 
     top = []
     for i in idx:
-        rid, qq, aa, source, tags = RAG_ROWS[int(i)]
+        rid, qq, aa, source, tags = rows[int(i)]
         base = float(scores[int(i)])
         boosted = min(0.999, base + _keyword_boost(question, qq, tags))
         top.append((boosted, rid, qq, aa, source, tags, base))
@@ -852,7 +926,6 @@ ensure_tables()
 load_rag_to_memory()
 
 
-
 @app.post("/postpartum/profile/ensure")
 def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
     if not req.user_id or not req.user_id.strip():
@@ -863,7 +936,6 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
     con = db_connect()
     cur = con.cursor()
 
-    # בדיקה אם כבר קיים פרופיל
     cur.execute(
         "SELECT user_id, postpartum_start_ts, opt_in FROM postpartum_profiles WHERE user_id = ?",
         (req.user_id,),
@@ -871,7 +943,6 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
     row = cur.fetchone()
 
     if row is None:
-        # יצירה ראשונית בלבד
         start_ts = req.postpartum_start_ts or now_ts
 
         cur.execute(
@@ -897,8 +968,6 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
             "postpartum_start_ts": start_ts,
         }
 
-    # קיים – no side effects
-    # מעדכנים updated_at בלבד, ו־start_ts רק אם נשלח במפורש
     if req.postpartum_start_ts is not None:
         cur.execute(
             """
@@ -927,6 +996,7 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
         "user_id": req.user_id,
         "opt_in": row["opt_in"],
     }
+
 
 # =========================
 # Daily support admin/run endpoint
@@ -961,7 +1031,8 @@ def health():
         "fast_cache_score_min": FAST_CACHE_SCORE_MIN,
         "chat_model": CHAT_MODEL,
         "embed_model": EMBED_MODEL,
-        "rag_rows_loaded": len(RAG_ROWS),
+        "rag_rows_auth_loaded": len(RAG_ROWS_AUTH),
+        "rag_rows_comm_loaded": len(RAG_ROWS_COMM),
         "rag_ready": RAG_READY,
     }
 
@@ -1046,9 +1117,7 @@ def debug_daily_support(
             cur.execute("SELECT COUNT(1) AS total FROM daily_support_messages WHERE is_active=1")
             total = int((cur.fetchone()["total"] or 0))
 
-            cur.execute(
-                "SELECT COUNT(1) AS day1 FROM daily_support_messages WHERE day_index=1 AND is_active=1"
-            )
+            cur.execute("SELECT COUNT(1) AS day1 FROM daily_support_messages WHERE day_index=1 AND is_active=1")
             day1 = int((cur.fetchone()["day1"] or 0))
 
             cur.execute(
@@ -1100,7 +1169,12 @@ def debug_daily_support(
 @app.post("/reload_rag")
 def reload_rag():
     load_rag_to_memory()
-    return {"ok": True, "rag_rows_loaded": len(RAG_ROWS), "rag_ready": RAG_READY}
+    return {
+        "ok": True,
+        "rag_rows_auth_loaded": len(RAG_ROWS_AUTH),
+        "rag_rows_comm_loaded": len(RAG_ROWS_COMM),
+        "rag_ready": RAG_READY,
+    }
 
 
 @app.post("/ask")
@@ -1111,11 +1185,13 @@ def ask(req: AskReq):
     qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
-    top = retrieve_top_k(qv, q_for_retrieval, req.k)
+    # Debug endpoint: show both tiers (helps validate quality)
+    top_auth = retrieve_top_k(qv, q_for_retrieval, req.k, tier="authoritative")
+    top_comm = retrieve_top_k(qv, q_for_retrieval, req.k, tier="community")
     t.mark("retrieve_ms")
 
     return {
-        "matches": [
+        "matches_authoritative": [
             {
                 "score": round(score, 4),
                 "score_base": round(base, 4),
@@ -1125,7 +1201,19 @@ def ask(req: AskReq):
                 "source": source,
                 "tags": tags,
             }
-            for (score, rid, qq, aa, source, tags, base) in top
+            for (score, rid, qq, aa, source, tags, base) in top_auth
+        ],
+        "matches_community": [
+            {
+                "score": round(score, 4),
+                "score_base": round(base, 4),
+                "id": rid,
+                "question": qq,
+                "answer": aa,
+                "source": source,
+                "tags": tags,
+            }
+            for (score, rid, qq, aa, source, tags, base) in top_comm
         ],
         "timing": t.snapshot(),
     }
@@ -1152,7 +1240,13 @@ def ask_final(req: AskReq):
     qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
-    top = retrieve_top_k(qv, q_for_retrieval, req.k)
+    # Tiered retrieval: authoritative first
+    top = retrieve_top_k(qv, q_for_retrieval, req.k, tier="authoritative")
+    tier_used = "authoritative"
+    if not top:
+        top = retrieve_top_k(qv, q_for_retrieval, req.k, tier="community")
+        tier_used = "community"
+
     t.mark("retrieve_ms")
 
     if not top:
@@ -1168,6 +1262,7 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_matches": [],
+            "tier_used": tier_used,
             "timing": t.snapshot(),
         }
 
@@ -1182,6 +1277,7 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
+            "tier_used": tier_used,
             "top_matches": [
                 {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                 for (s, rid, *_r, _source, tags, base) in top
@@ -1197,6 +1293,7 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
+            "tier_used": tier_used,
             "top_matches": [
                 {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                 for (s, rid, *_r, _source, tags, base) in top
@@ -1212,6 +1309,7 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
+            "tier_used": tier_used,
             "top_matches": [
                 {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                 for (s, rid, *_r, _source, tags, base) in top
@@ -1240,6 +1338,7 @@ def ask_final(req: AskReq):
             "cache_type": cache_type,
             "followup": followup,
             "top_score": round(top_score, 4),
+            "tier_used": tier_used,
             "top_matches": [
                 {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                 for (s, rid, *_r, _source, tags, base) in top
@@ -1256,6 +1355,7 @@ def ask_final(req: AskReq):
             "cache_type": "none",
             "followup": followup,
             "top_score": round(top_score, 4),
+            "tier_used": tier_used,
             "top_matches": [
                 {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
                 for (s, rid, *_r, _source, tags, base) in top
@@ -1322,6 +1422,7 @@ def ask_final(req: AskReq):
         "cache_type": cache_type,
         "followup": followup,
         "top_score": round(top_score, 4),
+        "tier_used": tier_used,
         "top_matches": [
             {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
             for (s, rid, *_r, _source, tags, base) in top
