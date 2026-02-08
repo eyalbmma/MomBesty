@@ -4,7 +4,7 @@ import sqlite3
 import time
 import hashlib
 import re
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 from fastapi import FastAPI, Response, HTTPException
@@ -48,6 +48,7 @@ FAST_CACHE_SCORE_MIN = 0.72
 FOLLOWUP_HARD_FLOOR = 0.25  # מתחת לזה גם ב-follow-up לא נריץ GPT
 # ----------------------
 
+
 # =========================
 # App + Routers
 # =========================
@@ -67,6 +68,7 @@ app.include_router(circles_router)
 # daily support runner (server-side)
 from daily_support_sender import run_daily_support  # noqa: E402
 
+
 # =========================
 # CORS
 # =========================
@@ -79,9 +81,8 @@ app.add_middleware(
         "http://localhost:19006",
         "http://127.0.0.1:19006",
         "http://192.168.1.144:8081",
-       
     ],
-     allow_origin_regex=r"^https://.*\.netlify\.app$",
+    allow_origin_regex=r"^https://.*\.netlify\.app$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,6 +162,60 @@ def clip(s: str, n: int) -> str:
 
 
 # =========================
+# Age answer detection + anti-loop helpers
+# =========================
+_AGE_RE = re.compile(
+    r"^(?:בן|בת)?\s*\d{1,2}\s*(?:חודשים|חודש|שנים|שנה)?$"
+)
+
+
+def message_is_just_age_answer(text: str) -> bool:
+    t = norm_q(text)
+    return bool(_AGE_RE.match(t))
+
+
+def assistant_asked_age(text: str) -> bool:
+    t = norm_q(text)
+    return ("בן כמה" in t) or ("בת כמה" in t) or ("גיל התינוק" in t) or ("בן/בת כמה" in t)
+
+
+def find_last_meaningful_user_question(history: List[Tuple[str, str]]) -> str:
+    """
+    Finds last user message that is NOT just an age answer.
+    """
+    for role, content in reversed(history):
+        if role == "user" and content:
+            if not message_is_just_age_answer(content):
+                return content
+    return ""
+
+
+def build_question_with_age_if_needed(question: str, history: List[Tuple[str, str]]) -> str:
+    """
+    If user wrote only age (e.g. 'בן 6 חודשים') and previous assistant asked age,
+    merge with previous meaningful user question so retrieval + GPT answer the real issue.
+    """
+    if not message_is_just_age_answer(question):
+        return question
+
+    last_assistant = ""
+    for role, content in reversed(history):
+        if role == "assistant" and content:
+            last_assistant = content
+            break
+
+    if not last_assistant or not assistant_asked_age(last_assistant):
+        return question
+
+    prev_q = find_last_meaningful_user_question(history)
+    if not prev_q:
+        return question
+
+    # Merge: keeps context stable without DB changes
+    return f"שאלה קודמת: {clip(prev_q, 260)}\nגיל: {question}"
+
+
+# =========================
 # Ensure rag.db exists (download from Drive if missing)
 # =========================
 def ensure_rag_db():
@@ -202,176 +257,11 @@ def column_exists(table: str, col: str) -> bool:
 
 def ensure_tables():
     """
-    יוצר טבלאות מערכת (cache / conversations) + טבלאות התראות לפורום +
-    טבלאות daily support.
-    חשוב במיוחד ב-Render כי rag.db יכול להגיע מ-Drive בלי הטבלאות החדשות.
+    Creates system tables (cache / conversations) + forum notifications + daily support + circles.
+    חשוב ב-Render כי rag.db יכול להגיע מ-Drive בלי הטבלאות החדשות.
     """
     con = db_connect()
     cur = con.cursor()
-
-
-
-
-
-def ensure_source_tier():
-    """
-    Ensures rag_clean.source_tier exists and is populated.
-    Safe: won't block startup; closes DB properly.
-    """
-    con = None
-    try:
-        has_source_tier = column_exists(TABLE, "source_tier")
-
-        con = db_connect()
-        cur = con.cursor()
-
-        # 1) Add column if missing
-        if not has_source_tier:
-            cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN source_tier TEXT;")
-            con.commit()
-            print("[RAG] Added column source_tier")
-
-        # 2) Only backfill if there are NULL/empty values
-        cur.execute(
-            f"SELECT COUNT(1) AS c FROM {TABLE} "
-            f"WHERE source_tier IS NULL OR TRIM(source_tier) = ''"
-        )
-        missing = int(cur.fetchone()["c"] or 0)
-        if missing == 0:
-            return
-
-        # 3) Mark authoritative first (heuristics)
-        cur.execute(
-            f"""
-            UPDATE {TABLE}
-            SET source_tier='authoritative'
-            WHERE (source_tier IS NULL OR TRIM(source_tier) = '')
-              AND (
-                lower(COALESCE(source,'')) LIKE '%health.gov%' OR
-                lower(COALESCE(source,'')) LIKE '%me.health.gov%' OR
-                lower(COALESCE(source,'')) LIKE '%משרד הבריאות%' OR
-                lower(COALESCE(source,'')) LIKE '%clalit%' OR
-                lower(COALESCE(source,'')) LIKE '%maccabi%' OR
-                lower(COALESCE(source,'')) LIKE '%leumit%' OR
-                lower(COALESCE(source,'')) LIKE '%sheba%' OR
-                lower(COALESCE(source,'')) LIKE '%ichilov%' OR
-                lower(COALESCE(source,'')) LIKE '%rambam%' OR
-                lower(COALESCE(source,'')) LIKE '%assuta%' OR
-                lower(COALESCE(tags,''))  LIKE '%authoritative%' OR
-                lower(COALESCE(tags,''))  LIKE '%משרד הבריאות%'
-              );
-            """
-        )
-
-        # 4) Everything else becomes community
-        cur.execute(
-            f"""
-            UPDATE {TABLE}
-            SET source_tier='community'
-            WHERE source_tier IS NULL OR TRIM(source_tier) = '';
-            """
-        )
-
-        con.commit()
-
-        # Log counts (before closing!)
-        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='authoritative'")
-        auth_count = int(cur.fetchone()["c"] or 0)
-        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='community'")
-        comm_count = int(cur.fetchone()["c"] or 0)
-
-        print(f"[RAG] source_tier backfilled: authoritative={auth_count}, community={comm_count}")
-
-    except Exception as e:
-        # Never block server startup
-        print("[RAG] WARNING: ensure_source_tier failed:", str(e))
-        return
-    finally:
-        if con is not None:
-            try:
-                con.close()
-            except Exception:
-                pass
-
-    """
-    Ensures rag_clean.source_tier exists and is populated.
-    Safe: won't break startup if DB is read-only; will fallback gracefully.
-    """
-    try:
-        has_source_tier = column_exists(TABLE, "source_tier")
-
-        con = db_connect()
-        cur = con.cursor()
-
-        # 1) Add column if missing
-        if not has_source_tier:
-            try:
-                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN source_tier TEXT;")
-                con.commit()
-                has_source_tier = True
-                print("[RAG] Added column source_tier")
-            except Exception as e:
-                # If DB is read-only or ALTER not allowed, keep going
-                print("[RAG] WARNING: could not ALTER TABLE to add source_tier:", str(e))
-                con.close()
-                return
-
-        # 2) Only backfill if there are NULLs
-        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier IS NULL OR TRIM(source_tier) = ''")
-        missing = int(cur.fetchone()["c"] or 0)
-
-        if missing == 0:
-            con.close()
-            return
-
-        # 3) Mark authoritative first (based on source / tags heuristics)
-        # Adjust these patterns to match how YOUR 'source' strings look in the DB.
-        cur.execute(
-            f"""
-            UPDATE {TABLE}
-            SET source_tier='authoritative'
-            WHERE (source_tier IS NULL OR TRIM(source_tier) = '')
-              AND (
-                lower(COALESCE(source,'')) LIKE '%health.gov%' OR
-                lower(COALESCE(source,'')) LIKE '%me.health.gov%' OR
-                lower(COALESCE(source,'')) LIKE '%משרד הבריאות%' OR
-                lower(COALESCE(source,'')) LIKE '%clalit%' OR
-                lower(COALESCE(source,'')) LIKE '%maccabi%' OR
-                lower(COALESCE(source,'')) LIKE '%leumit%' OR
-                lower(COALESCE(source,'')) LIKE '%sheba%' OR
-                lower(COALESCE(source,'')) LIKE '%ichilov%' OR
-                lower(COALESCE(source,'')) LIKE '%rambam%' OR
-                lower(COALESCE(source,'')) LIKE '%assuta%' OR
-                lower(COALESCE(tags,''))  LIKE '%authoritative%' OR
-                lower(COALESCE(tags,''))  LIKE '%משרד הבריאות%'
-              );
-            """
-        )
-
-        # 4) Everything else becomes community
-        cur.execute(
-            f"""
-            UPDATE {TABLE}
-            SET source_tier='community'
-            WHERE source_tier IS NULL OR TRIM(source_tier) = '';
-            """
-        )
-
-        con.commit()
-
-        # quick log
-        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='authoritative'")
-        auth_count = int(cur.fetchone()["c"] or 0)
-        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='community'")
-        comm_count = int(cur.fetchone()["c"] or 0)
-
-        con.close()
-        print(f"[RAG] source_tier backfilled: authoritative={auth_count}, community={comm_count}")
-
-    except Exception as e:
-        # Never block server startup
-        print("[RAG] WARNING: ensure_source_tier failed:", str(e))
-        return
 
     # ---- LLM cache ----
     cur.execute(
@@ -521,10 +411,8 @@ def ensure_source_tier():
     )
 
     # =========================================================
-    # Circles Hub (Pros / Groups / Events / Areas)
+    # Circles Hub
     # =========================================================
-
-    # ---- Areas ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS circles_areas (
@@ -541,7 +429,6 @@ def ensure_source_tier():
         """
     )
 
-    # ---- Pros ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS circles_pros (
@@ -594,7 +481,6 @@ def ensure_source_tier():
         """
     )
 
-    # ---- Groups ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS circles_groups (
@@ -627,7 +513,6 @@ def ensure_source_tier():
         """
     )
 
-    # ---- Events ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS circles_events (
@@ -661,16 +546,90 @@ def ensure_source_tier():
         """
     )
 
-
-
-
-
-
-
-
-
     con.commit()
     con.close()
+
+
+def ensure_source_tier():
+    """
+    Ensures rag_clean.source_tier exists and is populated.
+    Safe: won't block startup; closes DB properly.
+    """
+    con = None
+    try:
+        has_source_tier = column_exists(TABLE, "source_tier")
+
+        con = db_connect()
+        cur = con.cursor()
+
+        # Add column if missing
+        if not has_source_tier:
+            try:
+                cur.execute(f"ALTER TABLE {TABLE} ADD COLUMN source_tier TEXT;")
+                con.commit()
+                print("[RAG] Added column source_tier")
+            except Exception as e:
+                print("[RAG] WARNING: could not add source_tier:", str(e))
+                return
+
+        # Backfill only if missing
+        cur.execute(
+            f"SELECT COUNT(1) AS c FROM {TABLE} "
+            f"WHERE source_tier IS NULL OR TRIM(source_tier) = ''"
+        )
+        missing = int(cur.fetchone()["c"] or 0)
+        if missing == 0:
+            return
+
+        # authoritative heuristics
+        cur.execute(
+            f"""
+            UPDATE {TABLE}
+            SET source_tier='authoritative'
+            WHERE (source_tier IS NULL OR TRIM(source_tier) = '')
+              AND (
+                lower(COALESCE(source,'')) LIKE '%health.gov%' OR
+                lower(COALESCE(source,'')) LIKE '%me.health.gov%' OR
+                lower(COALESCE(source,'')) LIKE '%משרד הבריאות%' OR
+                lower(COALESCE(source,'')) LIKE '%clalit%' OR
+                lower(COALESCE(source,'')) LIKE '%maccabi%' OR
+                lower(COALESCE(source,'')) LIKE '%leumit%' OR
+                lower(COALESCE(source,'')) LIKE '%sheba%' OR
+                lower(COALESCE(source,'')) LIKE '%ichilov%' OR
+                lower(COALESCE(source,'')) LIKE '%rambam%' OR
+                lower(COALESCE(source,'')) LIKE '%assuta%' OR
+                lower(COALESCE(tags,''))  LIKE '%authoritative%' OR
+                lower(COALESCE(tags,''))  LIKE '%משרד הבריאות%'
+              );
+            """
+        )
+
+        # rest => community
+        cur.execute(
+            f"""
+            UPDATE {TABLE}
+            SET source_tier='community'
+            WHERE source_tier IS NULL OR TRIM(source_tier) = '';
+            """
+        )
+
+        con.commit()
+
+        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='authoritative'")
+        auth_count = int(cur.fetchone()["c"] or 0)
+        cur.execute(f"SELECT COUNT(1) AS c FROM {TABLE} WHERE source_tier='community'")
+        comm_count = int(cur.fetchone()["c"] or 0)
+
+        print(f"[RAG] source_tier backfilled: authoritative={auth_count}, community={comm_count}")
+
+    except Exception as e:
+        print("[RAG] WARNING: ensure_source_tier failed:", str(e))
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def upsert_conversation(user_id: str, conversation_id: str):
@@ -870,7 +829,6 @@ def load_rag_to_memory():
             f"WHERE {where}"
         )
     else:
-        # fallback: everything treated as community if source_tier not present
         cur.execute(
             f"SELECT id, question, answer, source, tags, {EMB_COL} "
             f"FROM {TABLE} "
@@ -897,7 +855,6 @@ def load_rag_to_memory():
 
             row_pack = (int(rid), q or "", a or "", source or "", tags or "")
             tier = (source_tier or "").strip().lower()
-
             if tier == "authoritative":
                 embs_auth.append(ev)
                 local_rows_auth.append(row_pack)
@@ -912,7 +869,6 @@ def load_rag_to_memory():
                 continue
             if ev.size == 0:
                 continue
-
             row_pack = (int(rid), q or "", a or "", source or "", tags or "")
             embs_comm.append(ev)
             local_rows_comm.append(row_pack)
@@ -923,7 +879,9 @@ def load_rag_to_memory():
     RAG_EMBS_COMM = _norm_mat(embs_comm)
     RAG_ROWS_COMM = local_rows_comm
 
-    RAG_READY = (RAG_EMBS_AUTH is not None and len(RAG_ROWS_AUTH) > 0) or (RAG_EMBS_COMM is not None and len(RAG_ROWS_COMM) > 0)
+    RAG_READY = (RAG_EMBS_AUTH is not None and len(RAG_ROWS_AUTH) > 0) or (
+        RAG_EMBS_COMM is not None and len(RAG_ROWS_COMM) > 0
+    )
 
 
 def _keyword_boost(question: str, candidate_q: str, candidate_tags: str) -> float:
@@ -990,13 +948,7 @@ def topic_fallback(question: str, top_matches: List[Tuple]) -> str:
     qn = norm_q(question)
     tags_blob = " ".join([(m[5] or "") for m in top_matches]).lower()
 
-    if (
-        ("הנקה" in qn)
-        or ("שד" in qn)
-        or ("פטמה" in qn)
-        or ("breast" in tags_blob)
-        or ("breastfeeding" in tags_blob)
-    ):
+    if ("הנקה" in qn) or ("שד" in qn) or ("פטמה" in qn) or ("breast" in tags_blob) or ("breastfeeding" in tags_blob):
         return "כדי לדייק: בן/בת כמה התינוק, והאם יש כאב/סדקים או קושי בהיצמדות?"
 
     if ("שינה" in qn) or ("בכי" in qn) or ("אוכל" in qn) or ("האכלה" in qn):
@@ -1024,9 +976,9 @@ def topic_from_history(history: List[Tuple[str, str]]) -> str:
 def topic_fallback_followup(question: str, history: List[Tuple[str, str]]) -> str:
     t = topic_from_history(history)
     if t == "breastfeeding":
-        return "זה נשמע בהמשך להנקה/פטמות. כדי לדייק: את מחפשת משחה לפטמות פצועות או משהו למניעה? (מילה אחת: פצועות/מניעה)"
+        return "זה נשמע בהמשך להנקה/פטמות. כדי לדייק: את מחפשת פתרון לכאב/סדקים או לשיפור היצמדות? (מילה אחת: כאב/היצמדות)"
     if t == "sleep":
-        return "זה נשמע בהמשך לשינה. כדי לדייק: בן/בת כמה התינוק, והבעיה בעיקר בהירדמות או יקיצות תכופות?"
+        return "זה נשמע בהמשך לשינה. כדי לדייק: בן/בת כמה התינוק, והקושי יותר בהירדמות או ביקיצות?"
     if t == "feeding":
         return "זה נשמע בהמשך לאוכל/האכלה. כדי לדייק: בן/בת כמה התינוק, והאם מדובר בהנקה, שאיבה או בקבוק?"
     if t == "postpartum":
@@ -1077,8 +1029,11 @@ def is_followup_question(question: str, history: List[Tuple[str, str]]) -> bool:
 
 
 def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> str:
-    if not is_followup_question(question, history):
-        return question
+    # first: merge age-only answers when needed (anti-loop)
+    q2 = build_question_with_age_if_needed(question, history)
+
+    if not is_followup_question(q2, history):
+        return q2
 
     prev_user = ""
     for role, content in reversed(history):
@@ -1087,9 +1042,9 @@ def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> s
             break
 
     if not prev_user:
-        return question
+        return q2
 
-    return f"הקשר: {clip(prev_user, 220)}\nשאלה: {question}"
+    return f"הקשר: {clip(prev_user, 220)}\nשאלה: {q2}"
 
 
 # =========================
@@ -1101,7 +1056,9 @@ ensure_source_tier()
 load_rag_to_memory()
 
 
-
+# =========================
+# Postpartum profile ensure
+# =========================
 @app.post("/postpartum/profile/ensure")
 def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
     if not req.user_id or not req.user_id.strip():
@@ -1120,7 +1077,6 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
 
     if row is None:
         start_ts = req.postpartum_start_ts or now_ts
-
         cur.execute(
             """
             INSERT INTO postpartum_profiles (
@@ -1137,12 +1093,7 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
         con.commit()
         con.close()
 
-        return {
-            "ok": True,
-            "created": True,
-            "user_id": req.user_id,
-            "postpartum_start_ts": start_ts,
-        }
+        return {"ok": True, "created": True, "user_id": req.user_id, "postpartum_start_ts": start_ts}
 
     if req.postpartum_start_ts is not None:
         cur.execute(
@@ -1166,12 +1117,7 @@ def ensure_postpartum_profile(req: EnsurePostpartumProfileReq):
     con.commit()
     con.close()
 
-    return {
-        "ok": True,
-        "created": False,
-        "user_id": req.user_id,
-        "opt_in": row["opt_in"],
-    }
+    return {"ok": True, "created": False, "user_id": req.user_id, "opt_in": row["opt_in"]}
 
 
 # =========================
@@ -1222,30 +1168,11 @@ def debug_tables():
     con.close()
 
     wanted = ["postpartum_profiles", "daily_support_messages", "daily_support_delivery_log"]
-
-    return {
-        "ok": True,
-        "has": {t: (t in tables) for t in wanted},
-        "tables_count": len(tables),
-    }
+    return {"ok": True, "has": {t: (t in tables) for t in wanted}, "tables_count": len(tables)}
 
 
 @app.post("/debug/daily-support")
-def debug_daily_support(
-    action: str,
-    user_id: Optional[str] = None,
-    dry_run: bool = True,
-):
-    """
-    Single debug endpoint for daily support.
-    Actions:
-      - recent_token_users
-      - seed_minimal_messages
-      - messages_count
-      - create_test_user   (requires user_id)
-      - preview
-      - send_now           (dry_run=false to actually send)
-    """
+def debug_daily_support(action: str, user_id: Optional[str] = None, dry_run: bool = True):
     con = db_connect()
     cur = con.cursor()
     ts = int(time.time())
@@ -1262,10 +1189,7 @@ def debug_daily_support(
                 """
             )
             rows = cur.fetchall()
-            return {
-                "ok": True,
-                "users": [{"user_id": r["user_id"], "tokens": int(r["tokens"])} for r in rows],
-            }
+            return {"ok": True, "users": [{"user_id": r["user_id"], "tokens": int(r["tokens"])} for r in rows]}
 
         elif action == "seed_minimal_messages":
             cur.execute("SELECT COUNT(*) AS c FROM daily_support_messages")
@@ -1292,25 +1216,13 @@ def debug_daily_support(
         elif action == "messages_count":
             cur.execute("SELECT COUNT(1) AS total FROM daily_support_messages WHERE is_active=1")
             total = int((cur.fetchone()["total"] or 0))
-
             cur.execute("SELECT COUNT(1) AS day1 FROM daily_support_messages WHERE day_index=1 AND is_active=1")
             day1 = int((cur.fetchone()["day1"] or 0))
-
-            cur.execute(
-                "SELECT MIN(day_index) AS min_day, MAX(day_index) AS max_day "
-                "FROM daily_support_messages WHERE is_active=1"
-            )
+            cur.execute("SELECT MIN(day_index) AS min_day, MAX(day_index) AS max_day FROM daily_support_messages WHERE is_active=1")
             row = cur.fetchone()
             min_day = int(row["min_day"]) if row and row["min_day"] is not None else None
             max_day = int(row["max_day"]) if row and row["max_day"] is not None else None
-
-            return {
-                "ok": True,
-                "total_active": total,
-                "day1_active": day1,
-                "min_day": min_day,
-                "max_day": max_day,
-            }
+            return {"ok": True, "total_active": total, "day1_active": day1, "min_day": min_day, "max_day": max_day}
 
         elif action == "create_test_user":
             if not user_id:
@@ -1361,34 +1273,17 @@ def ask(req: AskReq):
     qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
-    # Debug endpoint: show both tiers (helps validate quality)
     top_auth = retrieve_top_k(qv, q_for_retrieval, req.k, tier="authoritative")
     top_comm = retrieve_top_k(qv, q_for_retrieval, req.k, tier="community")
     t.mark("retrieve_ms")
 
     return {
         "matches_authoritative": [
-            {
-                "score": round(score, 4),
-                "score_base": round(base, 4),
-                "id": rid,
-                "question": qq,
-                "answer": aa,
-                "source": source,
-                "tags": tags,
-            }
+            {"score": round(score, 4), "score_base": round(base, 4), "id": rid, "question": qq, "answer": aa, "source": source, "tags": tags}
             for (score, rid, qq, aa, source, tags, base) in top_auth
         ],
         "matches_community": [
-            {
-                "score": round(score, 4),
-                "score_base": round(base, 4),
-                "id": rid,
-                "question": qq,
-                "answer": aa,
-                "source": source,
-                "tags": tags,
-            }
+            {"score": round(score, 4), "score_base": round(base, 4), "id": rid, "question": qq, "answer": aa, "source": source, "tags": tags}
             for (score, rid, qq, aa, source, tags, base) in top_comm
         ],
         "timing": t.snapshot(),
@@ -1410,30 +1305,24 @@ def ask_final(req: AskReq):
     if req.conversation_id:
         add_message(req.conversation_id, "user", req.question)
 
-    followup = is_followup_question(req.question, history)
+    # anti-loop: if user answered only age, treat it as follow-up and merge with previous question for retrieval
+    followup = is_followup_question(req.question, history) or message_is_just_age_answer(req.question)
 
     q_for_retrieval = build_augmented_question(req.question, history)
     qv = get_embedding(q_for_retrieval, timing=t)
     t.mark("embed_ms")
 
     # Tiered retrieval: authoritative first
-    k_auth = max(req.k, 6)  # מחפשים יותר רחב במאגר המוסמך
+    k_auth = max(req.k, 6)
     top = retrieve_top_k(qv, q_for_retrieval, k_auth, tier="authoritative")
     tier_used = "authoritative"
-
     if not top:
         top = retrieve_top_k(qv, q_for_retrieval, req.k, tier="community")
         tier_used = "community"
-
-
     t.mark("retrieve_ms")
 
     if not top:
-        ans = (
-            topic_fallback_followup(req.question, history)
-            if followup
-            else "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?"
-        )
+        ans = topic_fallback_followup(req.question, history) if followup else "לא מצאתי מידע רלוונטי במאגר כרגע. אפשר לנסח מחדש במשפט אחד?"
         return {
             "answer": ans,
             "cached": False,
@@ -1447,7 +1336,11 @@ def ask_final(req: AskReq):
 
     top_score = float(top[0][0])
 
-    if top_score < FOLLOWUP_HARD_FLOOR:
+    # IMPORTANT: if user just provided age, we avoid falling back again and proceed to GPT,
+    # because we now have a proper merged question.
+    age_just_answered = message_is_just_age_answer(req.question)
+
+    if top_score < FOLLOWUP_HARD_FLOOR and (not age_just_answered):
         ans = topic_fallback_followup(req.question, history) if followup else topic_fallback(req.question, top)
         return {
             "answer": ans,
@@ -1457,14 +1350,11 @@ def ask_final(req: AskReq):
             "followup": followup,
             "top_score": round(top_score, 4),
             "tier_used": tier_used,
-            "top_matches": [
-                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                for (s, rid, *_r, _source, tags, base) in top
-            ],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
-    if top_score < SOFT_CUTOFF and not followup:
+    if top_score < SOFT_CUTOFF and (not followup) and (not age_just_answered):
         return {
             "answer": topic_fallback(req.question, top),
             "cached": False,
@@ -1473,10 +1363,7 @@ def ask_final(req: AskReq):
             "followup": followup,
             "top_score": round(top_score, 4),
             "tier_used": tier_used,
-            "top_matches": [
-                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                for (s, rid, *_r, _source, tags, base) in top
-            ],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -1489,10 +1376,7 @@ def ask_final(req: AskReq):
             "followup": followup,
             "top_score": round(top_score, 4),
             "tier_used": tier_used,
-            "top_matches": [
-                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                for (s, rid, *_r, _source, tags, base) in top
-            ],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -1508,7 +1392,6 @@ def ask_final(req: AskReq):
 
     cached = cache_get(ck)
     t.mark("cache_get_ms")
-
     if cached:
         return {
             "answer": cached,
@@ -1518,10 +1401,7 @@ def ask_final(req: AskReq):
             "followup": followup,
             "top_score": round(top_score, 4),
             "tier_used": tier_used,
-            "top_matches": [
-                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                for (s, rid, *_r, _source, tags, base) in top
-            ],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -1535,10 +1415,7 @@ def ask_final(req: AskReq):
             "followup": followup,
             "top_score": round(top_score, 4),
             "tier_used": tier_used,
-            "top_matches": [
-                {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-                for (s, rid, *_r, _source, tags, base) in top
-            ],
+            "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
             "timing": t.snapshot(),
         }
 
@@ -1560,37 +1437,31 @@ def ask_final(req: AskReq):
             lines.append(f"{role_h}: {clip(content, 220)}")
         history_text = "\n".join(lines)
     t.mark("build_history_ms")
+
     system = (
-    "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, קצרה ולא שיפוטית.\n"
-    "כללים קשיחים:\n"
-    "1) אל תאבחני ואל תתני הוראות טיפול רפואי. הסתמכי רק על המידע מהמאגר.\n"
-    "2) חובה להתחיל במשפט תיקוף רגשי אחד קצר, אנושי ולא טכני "
-    "(לא ניסוח גנרי כמו \"מבינה שזה מלחיץ\").\n"
-    "3) תשובה במבנה מנחה (לא רשימת בדיקה):\n"
-    "   א) תיקוף רגשי (שורה אחת)\n"
-    "   ב) מה לעשות עכשיו (2–4 נקודות רכות)\n"
-    "   ג) מתי לפנות לבדיקה/מוקד (ברור, לא מאיים)\n"
-    "   ד) שאלה אחת קצרה בסוף — רק אם באמת חסר פרט קריטי. אם לא חסר, סיימי בלי שאלה.\n"
-    "4) אם השאלה על תינוק/ה: גיל התינוק הוא פרט קריטי כמעט תמיד. אם לא צוין גיל — שאלי רק על גיל.\n"
-    "5) הימנעי ממספרים קשיחים (כמו כמות חיתולים/יציאות/ימים) "
-    "אלא אם הם קריטיים לבטיחות. אם משתמשים במספר — הדגישי שזה טווח גס ולא יעד.\n"
-    "6) אל תנסחי \"בדקי אם...\" או \"שימי לב ש...\" כרשימת מטלות. "
-    "העדיפי ניסוח מרכך: \"סימנים שבדרך כלל מרגיעים רופאים הם…\".\n"
-    "7) אם מדובר בחום בתינוק צעיר מאוד (עד ~3 חודשים) — "
-    "אל תשאלי על 'עוד סימפטומים' כשאלה מסכמת; "
-    "במקום זה סיימי בהנחיית פנייה/מדידה קצרה או שאלי רק 'איך נמדד החום?'.\n"
+        "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, קצרה ולא שיפוטית.\n"
+        "כללים קשיחים:\n"
+        "1) אל תאבחני ואל תתני הוראות טיפול רפואי. הסתמכי רק על המידע מהמאגר.\n"
+        "2) התחילי במשפט תיקוף רגשי אחד קצר, אנושי ולא טכני.\n"
+        "3) מבנה:\n"
+        "   א) תיקוף רגשי (שורה)\n"
+        "   ב) מה אפשר לעשות עכשיו (2–4 נקודות קצרות)\n"
+        "   ג) מתי לפנות לבדיקה/מוקד (2–4 נקודות, ברור)\n"
+        "   ד) שאלה אחת בסוף רק אם חסר פרט קריטי. אם לא חסר — בלי שאלה.\n"
+        "4) אם השאלה על תינוק/ה: אם לא צוין גיל בשיחה — שאלי רק על גיל. "
+        "אם הגיל כבר נמסר — אל תשאלי שוב גיל.\n"
+        "5) הימנעי ממספרים כלליים בלי הקשר; אם חייבים מספר — צייני שזה טווח גס.\n"
+        "6) הימנעי מרשימת מטלות ארוכה. צעדים קטנים וברורים.\n"
+        "7) אם מדובר בחום בתינוק צעיר מאוד (עד ~3 חודשים): אל תסיימי בשאלה "
+        "על 'עוד סימפטומים'. לכל היותר שאלי 'איך נמדד החום?'.\n"
     )
 
-
-
     user = (
-    f"שאלה: {req.question}\n"
-    f"הקשר קודם (אם יש): {history_text or 'אין'}\n\n"
-    f"מידע מהמאגר (בלבד):\n{context}\n\n"
-    "כתבי תשובה קצרה (עד 10 שורות). "
-    "השתמשי במבנה: תיקוף רגשי → מה לעשות עכשיו → מתי לפנות → שאלה אחת.\n"
-)
-
+        f"שאלה: {req.question}\n"
+        f"הקשר קודם (אם יש): {history_text or 'אין'}\n\n"
+        f"מידע מהמאגר (בלבד):\n{context}\n\n"
+        "כתבי תשובה עד 10 שורות. השתמשי במבנה: תיקוף → מה לעשות עכשיו → מתי לפנות → (שאלה אחת רק אם צריך).\n"
+    )
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -1619,9 +1490,6 @@ def ask_final(req: AskReq):
         "followup": followup,
         "top_score": round(top_score, 4),
         "tier_used": tier_used,
-        "top_matches": [
-            {"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags}
-            for (s, rid, *_r, _source, tags, base) in top
-        ],
+        "top_matches": [{"score": round(s, 4), "score_base": round(base, 4), "id": rid, "tags": tags} for (s, rid, *_r, _source, tags, base) in top],
         "timing": t.snapshot(),
     }
