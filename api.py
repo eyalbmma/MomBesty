@@ -166,8 +166,10 @@ def ask_final(req: AskReq):
 
         # ✅ de-dup רגשי: אם כבר הייתה "פתיחה רגשית מלאה" בשיחה, עוברים ל-followup mode
         mode = "full"
-        if intent == "emotional" and already_had_emotional_opening(history):
-            mode = "followup"
+    if intent == "emotional":
+     has_any_assistant = any(r == "assistant" and (c or "").strip() for r, c in history)
+     if has_any_assistant:
+        mode = "followup"
 
         answer = build_gpt_answer(
             question=augmented_q,
