@@ -6,7 +6,7 @@ from openai import OpenAI
 
 print("RUNNING embed_db.py")
 
-DB_PATH = "rag.db"
+DB_PATH = "/data/rag.db"
 TABLE = "rag_clean"
 ID_COL = "id"
 EMB_COL = "embedding"

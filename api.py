@@ -3,7 +3,7 @@ import os
 import time
 from typing import Optional, List, Tuple
 
-from fastapi import FastAPI, Response, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -52,7 +52,6 @@ app.add_middleware(
 # =========================
 class AskReq(BaseModel):
     question: str
-    k: int = 3
     user_id: Optional[str] = None
     conversation_id: Optional[str] = None
 
@@ -62,13 +61,12 @@ class AskReq(BaseModel):
 # =========================
 from chat_engine import (
     build_augmented_question,
-    topic_fallback,
     build_gpt_answer,
-    message_is_just_age_answer,
+    topic_fallback,
 )
 
 # =========================
-# DB helpers (נשארים כאן)
+# DB helpers
 # =========================
 import sqlite3
 
@@ -115,6 +113,24 @@ def get_recent_messages(conversation_id: str, limit: int = 6) -> List[Tuple[str,
 
 
 # =========================
+# Intent Router (פשוט ומכוון)
+# =========================
+def detect_intent(question: str) -> str:
+    q = question.strip().lower()
+
+    if len(q.split()) <= 2:
+        return "unclear"
+
+    if any(w in q for w in ["מוצפת", "קשה לי", "בוכה", "מפחדת", "לא עומדת"]):
+        return "emotional"
+
+    if any(w in q for w in ["כואב", "חום", "דימום", "תפרים"]):
+        return "physical"
+
+    return "general"
+
+
+# =========================
 # Health
 # =========================
 @app.get("/health")
@@ -137,17 +153,17 @@ def ask_final(req: AskReq):
     if req.conversation_id:
         add_message(req.conversation_id, "user", req.question)
 
-    # 🔹 שלב זהה למה שהיה – רק מופרד
-    augmented_q = build_augmented_question(req.question, history)
+    intent = detect_intent(req.question)
 
-    # ⚠️ כרגע אין Intent / RAG כאן בכוונה
-    # אם אין הקשר מספק – fallback
-    if not augmented_q or len(augmented_q) < 3:
+    # 🔹 1. חוסר מידע → שאלה מבהירה, בלי GPT
+    if intent == "unclear":
         answer = topic_fallback(req.question)
+
+    # 🔹 2. מצוקה רגשית / פיזית → GPT אבל עם הקשר
     else:
-        # בינתיים context ריק – נתקן בשלב הבא
+        augmented_q = build_augmented_question(req.question, history)
         answer = build_gpt_answer(
-            question=req.question,
+            question=augmented_q,
             history=history,
             context="",
         )
@@ -157,6 +173,6 @@ def ask_final(req: AskReq):
 
     return {
         "answer": answer,
-        "used_gpt": True,
-        "cached": False,
+        "intent": intent,
+        "used_gpt": intent != "unclear",
     }
