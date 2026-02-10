@@ -1,36 +1,23 @@
 # chat_engine.py
-import json
-import time
 import hashlib
 import re
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
-import numpy as np
 from openai import OpenAI
 
 # =========================
-# Chat config (import from main if תרצה בהמשך)
+# Chat config
 # =========================
-EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 
-HISTORY_LIMIT_DB = 6
 HISTORY_LIMIT_TO_GPT = 4
 CLIP_Q_CHARS = 220
-CLIP_A_CHARS = 700
 MAX_TOKENS = 320
 TEMPERATURE = 0.3
-
-TOP_SCORE_THRESHOLD = 0.80
-LOW_SCORE_CUTOFF = 0.65
-SOFT_CUTOFF = 0.45
-FOLLOWUP_HARD_FLOOR = 0.25
-FAST_CACHE_SCORE_MIN = 0.72
 
 PROMPT_VER = "v9-empathy-safety-structure"
 
 client = OpenAI()
-
 
 # =========================
 # Text helpers
@@ -66,12 +53,18 @@ def is_followup_question(question: str, history: List[Tuple[str, str]]) -> bool:
     if not history:
         return False
     qn = norm_q(question)
+    if not qn:
+        return False
     if len(qn.split()) <= 5:
         return True
     return any(qn.startswith(s) for s in ["איזה", "מה", "איך", "כמה", "איפה", "זה"])
 
 
 def build_augmented_question(question: str, history: List[Tuple[str, str]]) -> str:
+    """
+    anti-loop: אם המשתמש/ת ענו רק גיל אחרי שהעוזרת שאלה גיל,
+    מחברים את הגיל לשאלה הקודמת לצורך דיוק.
+    """
     if not message_is_just_age_answer(question):
         return question
 
@@ -104,7 +97,7 @@ def topic_fallback(question: str) -> str:
 
 
 # =========================
-# Cache keys
+# (אופציונלי) cache key — לא בשימוש כרגע אצלך ב-api.py
 # =========================
 def make_cache_key_conversational(
     question: str,
@@ -125,26 +118,54 @@ def make_cache_key_conversational(
 
 
 # =========================
+# De-dup helper
+# =========================
+def already_had_emotional_opening(history: List[Tuple[str, str]]) -> bool:
+    """
+    האם כבר הייתה "פתיחה רגשית מלאה" בשיחה.
+    חיפוש פשוט לפי משפטי פתיחה נפוצים.
+    """
+    for role, content in history:
+        if role == "assistant" and content:
+            if "זה מאוד טבעי להרגיש" in content or "זה טבעי להרגיש" in content:
+                return True
+    return False
+
+
+# =========================
 # GPT answer builder
 # =========================
 def build_gpt_answer(
     question: str,
     history: List[Tuple[str, str]],
     context: str,
+    mode: str = "full",  # ✅ חדש: "full" או "followup"
 ) -> str:
     history_text = "\n".join(
-        [f"{'אמא' if r=='user' else 'עוזרת'}: {clip(c, 220)}" for r, c in history[-4:]]
+        [f"{'אמא' if r == 'user' else 'עוזרת'}: {clip(c, 220)}" for r, c in history[-HISTORY_LIMIT_TO_GPT:]]
     )
 
-    system = (
-        "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, רגישה ולא שיפוטית.\n"
-        "מבנה חובה:\n"
-        "1) תיקוף רגשי קצר\n"
-        "2) מה אפשר לעשות עכשיו (2–3 נקודות)\n"
-        "3) מתי לפנות לבדיקה\n"
-        "4) שאלה אחת רק אם חסר פרט קריטי\n"
-        "אל תאבחני ואל תתני טיפול רפואי."
-    )
+    if mode == "followup":
+        system = (
+            "את עוזרת לאימהות אחרי לידה.\n"
+            "כבר ניתן תיקוף רגשי קודם בשיחה.\n"
+            "אל תחזרי על פתיח רגשי כללי (כמו 'זה טבעי להרגיש...').\n"
+            "במקום זה:\n"
+            "- תני משפט אחד קצר שמכיר בזה שזה עדיין קשה.\n"
+            "- הציעי צעד קטן חדש אחד (לא לחזור על אותן עצות).\n"
+            "- שאלי שאלה אחת ממוקדת כדי להבין מה הכי מכביד עכשיו.\n"
+            "אל תאבחני ואל תתני טיפול רפואי."
+        )
+    else:
+        system = (
+            "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, רגישה ולא שיפוטית.\n"
+            "מבנה חובה:\n"
+            "1) תיקוף רגשי קצר\n"
+            "2) מה אפשר לעשות עכשיו (2–3 נקודות)\n"
+            "3) מתי לפנות לבדיקה\n"
+            "4) שאלה אחת רק אם חסר פרט קריטי\n"
+            "אל תאבחני ואל תתני טיפול רפואי."
+        )
 
     user = (
         f"שאלה: {question}\n"

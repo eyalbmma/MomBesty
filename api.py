@@ -1,6 +1,7 @@
 # api.py
 import os
 import time
+import sqlite3
 from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, HTTPException
@@ -63,13 +64,12 @@ from chat_engine import (
     build_augmented_question,
     build_gpt_answer,
     topic_fallback,
+    already_had_emotional_opening,  # ✅ חדש: de-dup helper
 )
 
 # =========================
 # DB helpers
 # =========================
-import sqlite3
-
 DB_PATH = "/data/rag.db"
 
 
@@ -116,7 +116,7 @@ def get_recent_messages(conversation_id: str, limit: int = 6) -> List[Tuple[str,
 # Intent Router (פשוט ומכוון)
 # =========================
 def detect_intent(question: str) -> str:
-    q = question.strip().lower()
+    q = (question or "").strip().lower()
 
     if len(q.split()) <= 2:
         return "unclear"
@@ -143,7 +143,7 @@ def health():
 # =========================
 @app.post("/ask_final")
 def ask_final(req: AskReq):
-    if not req.question.strip():
+    if not (req.question or "").strip():
         raise HTTPException(status_code=400, detail="question is required")
 
     history: List[Tuple[str, str]] = []
@@ -155,18 +155,27 @@ def ask_final(req: AskReq):
 
     intent = detect_intent(req.question)
 
-    # 🔹 1. חוסר מידע → שאלה מבהירה, בלי GPT
+    # 🔹 1) חוסר מידע → fallback קצר, בלי GPT
     if intent == "unclear":
         answer = topic_fallback(req.question)
+        used_gpt = False
 
-    # 🔹 2. מצוקה רגשית / פיזית → GPT אבל עם הקשר
+    # 🔹 2) יש intent ברור → GPT
     else:
         augmented_q = build_augmented_question(req.question, history)
+
+        # ✅ de-dup רגשי: אם כבר הייתה "פתיחה רגשית מלאה" בשיחה, עוברים ל-followup mode
+        mode = "full"
+        if intent == "emotional" and already_had_emotional_opening(history):
+            mode = "followup"
+
         answer = build_gpt_answer(
             question=augmented_q,
             history=history,
             context="",
+            mode=mode,  # ✅ חדש
         )
+        used_gpt = True
 
     if req.conversation_id:
         add_message(req.conversation_id, "assistant", answer)
@@ -174,5 +183,5 @@ def ask_final(req: AskReq):
     return {
         "answer": answer,
         "intent": intent,
-        "used_gpt": intent != "unclear",
+        "used_gpt": used_gpt,
     }
