@@ -138,9 +138,6 @@ def health():
     return {"ok": True, "version": APP_VERSION}
 
 
-# =========================
-# Chat endpoint
-# =========================
 @app.post("/ask_final")
 def ask_final(req: AskReq):
     if not (req.question or "").strip():
@@ -155,27 +152,29 @@ def ask_final(req: AskReq):
 
     intent = detect_intent(req.question)
 
-    # 🔹 1) חוסר מידע → fallback קצר, בלי GPT
+    # 1) חוסר מידע → fallback קצר, בלי GPT
     if intent == "unclear":
         answer = topic_fallback(req.question)
         used_gpt = False
 
-    # 🔹 2) יש intent ברור → GPT
+    # 2) יש intent ברור → GPT
     else:
         augmented_q = build_augmented_question(req.question, history)
 
-        # ✅ de-dup רגשי: אם כבר הייתה "פתיחה רגשית מלאה" בשיחה, עוברים ל-followup mode
         mode = "full"
-    if intent == "emotional":
-     has_any_assistant = any(r == "assistant" and (c or "").strip() for r, c in history)
-     if has_any_assistant:
-        mode = "followup"
+        if intent == "emotional":
+            has_any_assistant = any(
+                r == "assistant" and (c or "").strip()
+                for r, c in history
+            )
+            if has_any_assistant:
+                mode = "followup"
 
         answer = build_gpt_answer(
             question=augmented_q,
             history=history,
             context="",
-            mode=mode,  # ✅ חדש
+            mode=mode,
         )
         used_gpt = True
 
