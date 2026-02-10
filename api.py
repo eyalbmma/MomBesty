@@ -64,8 +64,8 @@ from chat_engine import (
     build_augmented_question,
     build_gpt_answer,
     topic_fallback,
-    already_had_emotional_opening,  # ✅ חדש: de-dup helper
 )
+
 
 # =========================
 # DB helpers
