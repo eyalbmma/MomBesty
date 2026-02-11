@@ -161,14 +161,13 @@ def ask_final(req: AskReq):
     else:
         augmented_q = build_augmented_question(req.question, history)
 
-        mode = "full"
-        if intent == "emotional":
-            has_any_assistant = any(
-                r == "assistant" and (c or "").strip()
-                for r, c in history
-            )
-            if has_any_assistant:
-                mode = "followup"
+    mode = "full"
+    if intent == "emotional":
+     # followup רק אם כבר יש תשובת עוזרת *לפני ההודעה הנוכחית*
+     # (כלומר: היסטוריה מכילה לפחות הודעת assistant אחת)
+     if any(r == "assistant" and (c or "").strip() for r, c in history):
+        mode = "followup"
+
 
         answer = build_gpt_answer(
             question=augmented_q,
