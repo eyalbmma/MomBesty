@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-16-state-lite-last3steps"
+APP_VERSION = "render-test-17-state-lite-intent-hardened"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -81,7 +81,6 @@ def ensure_schema():
     con = db_connect()
     cur = con.cursor()
 
-    # Create table if not exists (new installs)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS conversation_state (
@@ -94,7 +93,6 @@ def ensure_schema():
         """
     )
 
-    # Add column safely for existing DBs (SQLite has no IF NOT EXISTS for ADD COLUMN)
     cur.execute("PRAGMA table_info(conversation_state);")
     cols = {row[1] for row in cur.fetchall()}
     if "last_steps" not in cols:
@@ -196,12 +194,7 @@ def get_state(conversation_id: str) -> Dict[str, Any]:
     }
 
 
-def save_state(
-    conversation_id: str,
-    emotional_streak: int,
-    last_step: Optional[str],
-    last_steps: List[str],
-):
+def save_state(conversation_id: str, emotional_streak: int, last_step: Optional[str], last_steps: List[str]):
     ts = int(time.time())
     last_steps_json = json.dumps(last_steps or [], ensure_ascii=False)
 
@@ -224,9 +217,6 @@ def save_state(
 
 
 def pick_step(conversation_id: str, emotional_streak: int, last_steps: List[str]) -> str:
-    """
-    בוחר צעד בצורה דטרמיניסטית, אבל נמנע מלחזור על אחד מ-3 הצעדים האחרונים.
-    """
     last_steps = last_steps or []
     idx0 = abs(hash(f"{conversation_id}:{emotional_streak}")) % len(ALLOWED_STEPS)
 
@@ -235,12 +225,11 @@ def pick_step(conversation_id: str, emotional_streak: int, last_steps: List[str]
         if step not in last_steps:
             return step
 
-    # fallback (נדיר)
     return ALLOWED_STEPS[idx0]
 
 
 # =========================
-# Intent Router
+# Intent Router (מחוזק)
 # =========================
 def detect_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -252,157 +241,24 @@ def detect_intent(question: str) -> str:
         return "physical"
 
     emotional_phrases = [
-        "מוצפת",
-        "קשה לי",
-        "בוכה",
-        "מפחדת",
-        "לא עומדת",
-        "אומללה",
-        "רע לי",
-        "עצובה",
-        "בדידות",
-        "בודדה",
-        "עייפה",
-        "אין לי כוחות",
-        "נגמרו לי הכוחות",
-        "מתוסכלת",
-        "חסרת אונים",
-        "מרגישה לבד",
-        "לא מצליחה להתמודד",
-        "שבורה",
-        "דיכאון",
-        "חרדה",
-        "מיואשת",
-        "מותשת",
-        "מותשת נפשית",
-        "עומס נפשי",
-        "לא מתפקדת",
-        "לא מתפקד",
+        "מוצפת", "קשה לי", "בוכה", "מפחדת", "לא עומדת",
+        "אומללה", "רע לי", "עצובה", "בדידות", "בודדה",
+        "עייפה", "אין לי כוחות", "נגמרו לי הכוחות",
+        "מתוסכלת", "חסרת אונים", "מרגישה לבד",
+        "לא מצליחה להתמודד", "שבורה", "דיכאון", "חרדה",
+        "מיואשת", "מותשת", "מותשת נפשית", "עומס נפשי",
+        "לא מתפקדת", "לא מתפקד",
+        "לא משתפר", "נשברת", "נשברתי",
+        "לא טוב לי", "גרוע לי"
     ]
 
     if any(w in q for w in emotional_phrases):
         return "emotional"
 
-    if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה"]):
+    if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה", "נשברת"]):
         return "emotional"
 
     if any(x in q for x in ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת"]):
         return "emotional"
 
     return "general"
-
-
-# =========================
-# Health
-# =========================
-@app.get("/health")
-def health():
-    return {"ok": True, "version": APP_VERSION}
-
-
-# =========================
-# Chat endpoint
-# =========================
-@app.post("/ask_final")
-def ask_final(req: AskReq):
-    if not (req.question or "").strip():
-        raise HTTPException(status_code=400, detail="question is required")
-
-    history: List[Tuple[str, str]] = []
-    state: Dict[str, Any] = {"emotional_streak": 0, "last_step": None, "last_steps": []}
-
-    if req.conversation_id:
-        history = get_recent_messages(req.conversation_id)
-        state = get_state(req.conversation_id)
-
-    if req.conversation_id:
-        add_message(req.conversation_id, "user", req.question)
-
-    intent = detect_intent(req.question)
-
-    if req.conversation_id:
-        if intent == "emotional":
-            state["emotional_streak"] += 1
-        else:
-            state["emotional_streak"] = 0
-
-    forced_step: Optional[str] = None
-
-    # 1) unclear → fallback קצר
-    if intent == "unclear":
-        answer = topic_fallback(req.question)
-        used_gpt = False
-        mode = "fallback"
-
-    # 2) intent ברור
-    else:
-        augmented_q = build_augmented_question(req.question, history)
-        mode = "full"
-
-        if intent == "emotional":
-            has_assistant = any(r == "assistant" for r, _ in history)
-            if has_assistant:
-                streak = state["emotional_streak"]
-
-                if streak >= 7:
-                    mode = "followup_escalation"
-                elif streak >= 4:
-                    mode = "followup_checkin"
-                else:
-                    mode = "followup"
-
-                forced_step = pick_step(
-                    req.conversation_id or "",
-                    streak,
-                    state.get("last_steps", []),
-                )
-
-                # update last_steps (keep last 3)
-                last_steps = list(state.get("last_steps", []))
-                last_steps.append(forced_step)
-                state["last_steps"] = last_steps[-3:]
-
-        # ✅ FOLLOWUP נעול בשרת
-        if mode in ("followup", "followup_checkin", "followup_escalation"):
-            ack = build_followup_ack(history)
-
-            if mode == "followup":
-                closed_q = "מה יותר קשה לך עכשיו — בדידות, עייפות, או לחץ סביב התינוק?"
-            elif mode == "followup_checkin":
-                closed_q = "הצלחת לנסות משהו קטן מאז? — כן, לא, או לא בטוחה?"
-            else:
-                closed_q = "איך התפקוד שלך כרגע היום — מצליחה, חלקית, או כמעט לא מצליחה?"
-
-            step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
-            answer = f"{ack}\n{step_line}\n{closed_q}"
-            used_gpt = True
-
-        # FULL רגיל
-        else:
-            answer = build_gpt_answer(
-                question=augmented_q,
-                history=history,
-                context="",
-                mode=mode,
-                forced_step=None,
-            )
-            used_gpt = True
-
-    if req.conversation_id:
-        add_message(req.conversation_id, "assistant", answer)
-        save_state(
-            req.conversation_id,
-            int(state["emotional_streak"] or 0),
-            forced_step if intent == "emotional" else None,
-            state.get("last_steps", []),
-        )
-
-    return {
-        "answer": answer,
-        "intent": intent,
-        "used_gpt": used_gpt,
-        "mode": mode,
-        "emotional_streak": state["emotional_streak"],
-        # אופציונלי לדיבוג:
-        # "last_steps": state.get("last_steps", []),
-    }
