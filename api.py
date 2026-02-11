@@ -9,9 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# =========================
-# App config
-# =========================
 APP_VERSION = "render-test-11-followup-context"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -66,7 +63,6 @@ from chat_engine import (
     topic_fallback,
 )
 
-
 # =========================
 # DB helpers
 # =========================
@@ -113,7 +109,7 @@ def get_recent_messages(conversation_id: str, limit: int = 6) -> List[Tuple[str,
 
 
 # =========================
-# Intent Router (פשוט ומכוון)
+# Intent Router
 # =========================
 def detect_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -138,6 +134,9 @@ def health():
     return {"ok": True, "version": APP_VERSION}
 
 
+# =========================
+# Chat endpoint
+# =========================
 @app.post("/ask_final")
 def ask_final(req: AskReq):
     if not (req.question or "").strip():
@@ -161,13 +160,11 @@ def ask_final(req: AskReq):
     else:
         augmented_q = build_augmented_question(req.question, history)
 
-    mode = "full"
-    if intent == "emotional":
-     # followup רק אם כבר יש תשובת עוזרת *לפני ההודעה הנוכחית*
-     # (כלומר: היסטוריה מכילה לפחות הודעת assistant אחת)
-     if any(r == "assistant" and (c or "").strip() for r, c in history):
-        mode = "followup"
-
+        mode = "full"
+        if intent == "emotional":
+            # followup רק אם כבר יש הודעת assistant בהיסטוריה
+            if any(r == "assistant" and (c or "").strip() for r, c in history):
+                mode = "followup"
 
         answer = build_gpt_answer(
             question=augmented_q,
