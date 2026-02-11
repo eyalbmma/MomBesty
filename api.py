@@ -232,33 +232,70 @@ def pick_step(conversation_id: str, emotional_streak: int, last_steps: List[str]
 # Intent Router (מחוזק)
 # =========================
 def detect_intent(question: str) -> str:
-    q = (question or "").strip().lower()
+    if not question:
+        return "unclear"
+
+    # נירמול בסיסי
+    q = question.strip().lower()
+    q = q.replace("?", "").replace("!", "").replace(".", "")
 
     if len(q.split()) <= 2:
         return "unclear"
 
-    if any(w in q for w in ["כואב", "חום", "דימום", "תפרים", "כאבים"]):
+    # =========================
+    # 1️⃣ physical קודם
+    # =========================
+    physical_keywords = [
+        "כואב", "כאבים", "חום", "דימום", "תפרים",
+        "פצע", "הפרשות", "זיהום"
+    ]
+
+    if any(w in q for w in physical_keywords):
         return "physical"
 
-    emotional_phrases = [
+    # =========================
+    # 2️⃣ emotional ישיר
+    # =========================
+    emotional_keywords = [
         "מוצפת", "קשה לי", "בוכה", "מפחדת", "לא עומדת",
         "אומללה", "רע לי", "עצובה", "בדידות", "בודדה",
         "עייפה", "אין לי כוחות", "נגמרו לי הכוחות",
         "מתוסכלת", "חסרת אונים", "מרגישה לבד",
-        "לא מצליחה להתמודד", "שבורה", "דיכאון", "חרדה",
-        "מיואשת", "מותשת", "מותשת נפשית", "עומס נפשי",
+        "לא מצליחה להתמודד", "שבורה",
+        "דיכאון", "חרדה", "מיואשת",
+        "מותשת", "מותשת נפשית", "עומס נפשי",
         "לא מתפקדת", "לא מתפקד",
         "לא משתפר", "נשברת", "נשברתי",
         "לא טוב לי", "גרוע לי"
     ]
 
-    if any(w in q for w in emotional_phrases):
+    if any(w in q for w in emotional_keywords):
         return "emotional"
 
-    if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה", "נשברת"]):
+    # =========================
+    # 3️⃣ צירופים שליליים חכמים
+    # =========================
+    negative_patterns = [
+        "לא מצליחה",
+        "לא מתפקדת",
+        "לא עומדת",
+        "לא טוב",
+        "לא מסוגלת",
+        "כמעט לא",
+    ]
+
+    if any(p in q for p in negative_patterns):
         return "emotional"
 
-    if any(x in q for x in ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת"]):
+    # =========================
+    # 4️⃣ מילים כלליות שמרמזות על מצוקה
+    # =========================
+    soft_emotional_hints = [
+        "נפש", "רגש", "עומס", "מתוסכל", "מותש",
+        "נשבר", "קשה", "לבד"
+    ]
+
+    if any(w in q for w in soft_emotional_hints):
         return "emotional"
 
     return "general"
