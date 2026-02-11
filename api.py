@@ -299,3 +299,114 @@ def detect_intent(question: str) -> str:
         return "emotional"
 
     return "general"
+
+
+# =========================
+# Health
+# =========================
+@app.get("/health")
+def health():
+    return {"ok": True, "version": APP_VERSION}
+
+
+# =========================
+# Chat endpoint
+# =========================
+@app.post("/ask_final")
+def ask_final(req: AskReq):
+    if not (req.question or "").strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    history: List[Tuple[str, str]] = []
+    state: Dict[str, Any] = {"emotional_streak": 0, "last_step": None, "last_steps": []}
+
+    if req.conversation_id:
+        history = get_recent_messages(req.conversation_id)
+        state = get_state(req.conversation_id)
+
+    if req.conversation_id:
+        add_message(req.conversation_id, "user", req.question)
+
+    intent = detect_intent(req.question)
+
+    if req.conversation_id:
+        if intent == "emotional":
+            state["emotional_streak"] += 1
+        else:
+            state["emotional_streak"] = 0
+            state["last_steps"] = []  # חשוב: מאפס רצף צעדים כשזה לא רגשי
+
+    forced_step: Optional[str] = None
+
+    if intent == "unclear":
+        answer = topic_fallback(req.question)
+        used_gpt = False
+        mode = "fallback"
+
+    else:
+        augmented_q = build_augmented_question(req.question, history)
+        mode = "full"
+
+        if intent == "emotional":
+            has_assistant = any(r == "assistant" for r, _ in history)
+            if has_assistant:
+                streak = int(state["emotional_streak"] or 0)
+
+                if streak >= 7:
+                    mode = "followup_escalation"
+                elif streak >= 4:
+                    mode = "followup_checkin"
+                else:
+                    mode = "followup"
+
+                forced_step = pick_step(
+                    req.conversation_id or "",
+                    streak,
+                    state.get("last_steps", []),
+                )
+
+                last_steps = list(state.get("last_steps", []))
+                last_steps.append(forced_step)
+                state["last_steps"] = last_steps[-3:]
+
+        # ✅ FOLLOWUP נעול בשרת
+        if mode in ("followup", "followup_checkin", "followup_escalation"):
+            ack = build_followup_ack(history)
+
+            if mode == "followup":
+                closed_q = "מה יותר קשה לך עכשיו — בדידות, עייפות, או לחץ סביב התינוק?"
+            elif mode == "followup_checkin":
+                closed_q = "הצלחת לנסות משהו קטן מאז? — כן, לא, או לא בטוחה?"
+            else:
+                closed_q = "איך התפקוד שלך כרגע היום — מצליחה, חלקית, או כמעט לא מצליחה?"
+
+            step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
+            answer = f"{ack}\n{step_line}\n{closed_q}"
+            used_gpt = True
+
+        else:
+            answer = build_gpt_answer(
+                question=augmented_q,
+                history=history,
+                context="",
+                mode=mode,
+                forced_step=None,
+            )
+            used_gpt = True
+
+    if req.conversation_id:
+        add_message(req.conversation_id, "assistant", answer)
+        save_state(
+            req.conversation_id,
+            int(state["emotional_streak"] or 0),
+            forced_step if intent == "emotional" else None,
+            state.get("last_steps", []),
+        )
+
+    return {
+        "answer": answer,
+        "intent": intent,
+        "used_gpt": used_gpt,
+        "mode": mode,
+        "emotional_streak": int(state["emotional_streak"] or 0),
+    }
