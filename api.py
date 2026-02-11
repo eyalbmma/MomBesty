@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-14-state-lite-intent-fix2"
+APP_VERSION = "render-test-15-state-lite-followup-locked"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -60,6 +60,7 @@ class AskReq(BaseModel):
 from chat_engine import (
     build_augmented_question,
     build_gpt_answer,
+    build_followup_ack,  # NEW
     topic_fallback,
 )
 
@@ -102,7 +103,6 @@ def ensure_schema():
 
 
 ensure_schema()
-
 
 # =========================
 # Conversation messages
@@ -204,7 +204,7 @@ def pick_step(conversation_id: str, emotional_streak: int, last_step: Optional[s
 
 
 # =========================
-# Intent Router (משופר)
+# Intent Router
 # =========================
 def detect_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -212,11 +212,10 @@ def detect_intent(question: str) -> str:
     if len(q.split()) <= 2:
         return "unclear"
 
-    # 1) physical קודם כדי לא להתנגש עם "מרגישה ..."
+    # physical קודם כדי לא להתנגש עם "מרגישה ..."
     if any(w in q for w in ["כואב", "חום", "דימום", "תפרים", "כאבים"]):
         return "physical"
 
-    # 2) emotional — ביטויים ברורים
     emotional_phrases = [
         "מוצפת",
         "קשה לי",
@@ -245,14 +244,15 @@ def detect_intent(question: str) -> str:
         "לא מתפקדת",
         "לא מתפקד",
     ]
+
     if any(w in q for w in emotional_phrases):
         return "emotional"
 
-    # ✅ המלצה 1: "מרגישה" רק עם רגש ברור (כבר היה)
+    # "מרגישה" רק עם רגש ברור
     if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה"]):
         return "emotional"
 
-    # ✅ המלצה 2: כלל "רגש/נפש/עומס" — תופס משפטים כמו "מותשת נפשית" גם אם ניסוח משתנה
+    # כלל "רגש/נפש/עומס"
     if any(x in q for x in ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת"]):
         return "emotional"
 
@@ -293,20 +293,21 @@ def ask_final(req: AskReq):
         else:
             state["emotional_streak"] = 0
 
+    forced_step: Optional[str] = None
+
+    # 1) unclear → fallback קצר
     if intent == "unclear":
         answer = topic_fallback(req.question)
         used_gpt = False
         mode = "fallback"
-        forced_step = None
 
+    # 2) intent ברור
     else:
         augmented_q = build_augmented_question(req.question, history)
         mode = "full"
-        forced_step = None
 
         if intent == "emotional":
             has_assistant = any(r == "assistant" for r, _ in history)
-
             if has_assistant:
                 streak = state["emotional_streak"]
 
@@ -323,20 +324,37 @@ def ask_final(req: AskReq):
                     state.get("last_step"),
                 )
 
-        answer = build_gpt_answer(
-            question=augmented_q,
-            history=history,
-            context="",
-            mode=mode,
-            forced_step=forced_step,
-        )
-        used_gpt = True
+        # ✅ FOLLOWUP נעול בשרת
+        if mode in ("followup", "followup_checkin", "followup_escalation"):
+            ack = build_followup_ack(history)
+
+            if mode == "followup":
+                closed_q = "מה יותר קשה לך עכשיו — בדידות, עייפות, או לחץ סביב התינוק?"
+            elif mode == "followup_checkin":
+                closed_q = "הצלחת לנסות משהו קטן מאז? — כן, לא, או לא בטוחה?"
+            else:
+                closed_q = "איך התפקוד שלך כרגע היום — מצליחה, חלקית, או כמעט לא מצליחה?"
+
+            step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
+            answer = f"{ack}\n{step_line}\n{closed_q}"
+            used_gpt = True  # השתמשנו ב-GPT למשפט אחד בלבד
+
+        # FULL רגיל
+        else:
+            answer = build_gpt_answer(
+                question=augmented_q,
+                history=history,
+                context="",
+                mode=mode,
+                forced_step=None,
+            )
+            used_gpt = True
 
     if req.conversation_id:
         add_message(req.conversation_id, "assistant", answer)
         save_state(
             req.conversation_id,
-            state["emotional_streak"],
+            int(state["emotional_streak"] or 0),
             forced_step if intent == "emotional" else None,
         )
 

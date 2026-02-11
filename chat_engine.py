@@ -1,4 +1,4 @@
-# chat_engine_state_lite.py
+# chat_engine.py
 import hashlib
 import re
 from typing import List, Tuple, Optional
@@ -14,7 +14,7 @@ HISTORY_LIMIT_TO_GPT = 4
 MAX_TOKENS = 320
 TEMPERATURE = 0.3
 
-PROMPT_VER = "v10-state-lite-steps"
+PROMPT_VER = "v11-followup-locked-ack-only"
 
 client = OpenAI()
 
@@ -85,14 +85,71 @@ def topic_fallback(question: str) -> str:
 
 
 # =========================
-# GPT answer builder
+# NEW: Followup ACK only (one short sentence)
+# =========================
+def build_followup_ack(history: List[Tuple[str, str]]) -> str:
+    """
+    מחזיר משפט פתיחה קצר אחד בלבד (ללא עצות/שאלות),
+    כדי שהשרת ינעל את הצעד + השאלה ולא ייווצרו "קיצורים" של GPT.
+    """
+    system = (
+        "את עוזרת לאימהות אחרי לידה.\n"
+        "כתבי משפט אחד בלבד, קצר בעברית, שמכיר בזה שקשה.\n"
+        "אסור להוסיף עצות, אסור להציע פעולות, אסור לשאול שאלה.\n"
+        "אסור להשתמש במספור.\n"
+        "רק משפט אחד."
+    )
+
+    history_text = "\n".join(
+        [f"{'אמא' if r == 'user' else 'עוזרת'}: {clip(c, 160)}" for r, c in history[-4:]]
+    )
+
+    user = f"הקשר קצר:\n{history_text or 'אין'}\n"
+
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+        max_tokens=40,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    return text if text else "שומעת אותך—זה באמת קשה."
+
+
+# =========================
+# (Optional) cache key — not used in api.py right now
+# =========================
+def make_cache_key_conversational(
+    question: str,
+    top_ids: List[int],
+    k: int,
+    conversation_id: Optional[str],
+    history: List[Tuple[str, str]],
+) -> str:
+    hist = "|".join([f"{r}:{norm_q(c)[:60]}" for r, c in history[-HISTORY_LIMIT_TO_GPT:]])
+    base = (
+        f"{PROMPT_VER}|{CHAT_MODEL}|k={k}"
+        f"|conv={conversation_id or ''}"
+        f"|q={norm_q(question)}"
+        f"|ids={','.join(map(str, top_ids))}"
+        f"|hist={hist}"
+    )
+    return hashlib.sha256(base.encode()).hexdigest()
+
+
+# =========================
+# GPT answer builder (FULL only in practice)
 # =========================
 def build_gpt_answer(
     question: str,
     history: List[Tuple[str, str]],
     context: str,
-    mode: str = "full",  # "full" | "followup" | "followup_checkin" | "followup_escalation"
-    forced_step: Optional[str] = None,
+    mode: str = "full",  # נשאר לתאימות
+    forced_step: Optional[str] = None,  # נשאר לתאימות
 ) -> str:
     history_text = "\n".join(
         [
@@ -101,44 +158,15 @@ def build_gpt_answer(
         ]
     )
 
-    if mode in ("followup", "followup_checkin", "followup_escalation"):
-        step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
-
-        if mode == "followup":
-            closed_q = "מה יותר קשה לך עכשיו — בדידות, עייפות, או לחץ סביב התינוק?"
-        elif mode == "followup_checkin":
-            closed_q = "הצלחת לנסות משהו קטן מאז? — כן, לא, או לא בטוחה?"
-        else:
-            closed_q = "איך התפקוד שלך כרגע היום — מצליחה, חלקית, או כמעט לא מצליחה?"
-
-        system = (
-            "את עוזרת לאימהות אחרי לידה.\n"
-            "כבר ניתן תיקוף רגשי קודם בשיחה.\n"
-            "אל תחזרי על פתיח רגשי כללי.\n\n"
-            "מטרה: תשובת המשך קצרה, ממוקדת ויציבה.\n"
-            "מבנה חובה:\n"
-            "1) משפט אחד קצר שמכיר בזה שזה עדיין קשה\n"
-            "2) צעד קטן אחד בלבד לביצוע עכשיו\n"
-            "3) שאלה סגורה אחת בלבד\n\n"
-            "כללים קשיחים:\n"
-            f"- הצעד חייב להיות בדיוק: {step_line}\n"
-            f"- השאלה חייבת להיות בדיוק: '{closed_q}'\n"
-            "אל תוסיפי צעד נוסף, אל תחליפי ניסוח, ואל תוסיפי עצות.\n\n"
-            "אסור להציע מוזיקה, יומן, מדיטציה או עצות כלליות אחרות.\n"
-            "אל תאבחני ואל תתני טיפול רפואי.\n"
-            "אם יש סימנים שמצריכים עזרה: נסחי בעדינות המלצה לפנות לאחות טיפת חלב/רופא/ה/גורם מקצועי."
-        )
-
-    else:
-        system = (
-            "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, רגישה ולא שיפוטית.\n"
-            "מבנה חובה:\n"
-            "1) תיקוף רגשי קצר\n"
-            "2) מה אפשר לעשות עכשיו (2–3 נקודות)\n"
-            "3) מתי לפנות לבדיקה\n"
-            "4) שאלה אחת רק אם חסר פרט קריטי\n"
-            "אל תאבחני ואל תתני טיפול רפואי."
-        )
+    system = (
+        "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, רגישה ולא שיפוטית.\n"
+        "מבנה חובה:\n"
+        "1) תיקוף רגשי קצר\n"
+        "2) מה אפשר לעשות עכשיו (2–3 נקודות)\n"
+        "3) מתי לפנות לבדיקה\n"
+        "4) שאלה אחת רק אם חסר פרט קריטי\n"
+        "אל תאבחני ואל תתני טיפול רפואי."
+    )
 
     user = (
         f"שאלה: {question}\n"
