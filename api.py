@@ -1,4 +1,4 @@
-# api_state_lite.py
+# api.py
 import os
 import time
 import sqlite3
@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-12-state-lite"
+APP_VERSION = "render-test-13-state-lite-intent-fix"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -57,14 +57,14 @@ class AskReq(BaseModel):
 # =========================
 # Chat engine import
 # =========================
-from chat_engine  import (
+from chat_engine import (
     build_augmented_question,
     build_gpt_answer,
     topic_fallback,
 )
 
 # =========================
-# DB helpers
+# DB
 # =========================
 DB_PATH = "/data/rag.db"
 
@@ -76,14 +76,9 @@ def db_connect():
 
 
 def ensure_schema():
-    """
-    רץ בעליית השרת, יוצר טבלאות/אינדקסים חדשים אם חסרים.
-    כך ב-Render, rag.db שנמצא ב-/data יקבל את הטבלה החדשה אוטומטית.
-    """
     con = db_connect()
     cur = con.cursor()
 
-    # state table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS conversation_state (
@@ -94,6 +89,7 @@ def ensure_schema():
         );
         """
     )
+
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_conv_state_updated
@@ -105,10 +101,12 @@ def ensure_schema():
     con.close()
 
 
-# חשוב: ליצור סכימה מיד בעליית האפליקציה
 ensure_schema()
 
 
+# =========================
+# Conversation messages
+# =========================
 def add_message(conversation_id: str, role: str, content: str):
     ts = int(time.time())
     con = db_connect()
@@ -143,7 +141,7 @@ def get_recent_messages(conversation_id: str, limit: int = 6) -> List[Tuple[str,
 
 
 # =========================
-# Conversation state helpers
+# Conversation state
 # =========================
 ALLOWED_STEPS: List[str] = [
     "לשתות מים + 3 נשימות איטיות",
@@ -198,16 +196,7 @@ def save_state(conversation_id: str, emotional_streak: int, last_step: Optional[
 
 
 def pick_step(conversation_id: str, emotional_streak: int, last_step: Optional[str]) -> str:
-    """
-    בחירה דטרמיניסטית כדי:
-    - להימנע מאקראיות
-    - להימנע מחזרה על אותו צעד
-    """
-    if not conversation_id:
-        idx = emotional_streak % len(ALLOWED_STEPS)
-    else:
-        idx = abs(hash(f"{conversation_id}:{emotional_streak}")) % len(ALLOWED_STEPS)
-
+    idx = abs(hash(f"{conversation_id}:{emotional_streak}")) % len(ALLOWED_STEPS)
     step = ALLOWED_STEPS[idx]
     if last_step and step == last_step:
         step = ALLOWED_STEPS[(idx + 1) % len(ALLOWED_STEPS)]
@@ -215,7 +204,7 @@ def pick_step(conversation_id: str, emotional_streak: int, last_step: Optional[s
 
 
 # =========================
-# Intent Router (כמו שהיה)
+# Intent Router (משופר)
 # =========================
 def detect_intent(question: str) -> str:
     q = (question or "").strip().lower()
@@ -223,11 +212,41 @@ def detect_intent(question: str) -> str:
     if len(q.split()) <= 2:
         return "unclear"
 
-    if any(w in q for w in ["מוצפת", "קשה לי", "בוכה", "מפחדת", "לא עומדת"]):
+    # physical קודם כדי לא להתנגש
+    if any(w in q for w in ["כואב", "חום", "דימום", "תפרים", "כאבים"]):
+        return "physical"
+
+    # emotional ביטויים ברורים
+    emotional_phrases = [
+        "מוצפת",
+        "קשה לי",
+        "בוכה",
+        "מפחדת",
+        "לא עומדת",
+        "אומללה",
+        "רע לי",
+        "עצובה",
+        "בדידות",
+        "בודדה",
+        "עייפה",
+        "אין לי כוחות",
+        "נגמרו לי הכוחות",
+        "מתוסכלת",
+        "חסרת אונים",
+        "מרגישה לבד",
+        "לא מצליחה להתמודד",
+        "שבורה",
+        "דיכאון",
+        "חרדה",
+        "מיואשת",
+    ]
+
+    if any(w in q for w in emotional_phrases):
         return "emotional"
 
-    if any(w in q for w in ["כואב", "חום", "דימום", "תפרים"]):
-        return "physical"
+    # צירופים חכמים
+    if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה"]):
+        return "emotional"
 
     return "general"
 
@@ -260,38 +279,27 @@ def ask_final(req: AskReq):
 
     intent = detect_intent(req.question)
 
-    # update streak
     if req.conversation_id:
         if intent == "emotional":
-            state["emotional_streak"] = int(state["emotional_streak"] or 0) + 1
+            state["emotional_streak"] += 1
         else:
             state["emotional_streak"] = 0
 
-    # 1) חוסר מידע → fallback קצר, בלי GPT
     if intent == "unclear":
         answer = topic_fallback(req.question)
         used_gpt = False
+        mode = "fallback"
 
-        if req.conversation_id:
-            # נשמר streak=0 (כי unclear לא emotional)
-            save_state(
-                req.conversation_id,
-                int(state["emotional_streak"] or 0),
-                state.get("last_step"),
-            )
-
-    # 2) יש intent ברור → GPT
     else:
         augmented_q = build_augmented_question(req.question, history)
-
         mode = "full"
-        forced_step: Optional[str] = None
+        forced_step = None
 
         if intent == "emotional":
-            has_assistant = any(r == "assistant" and (c or "").strip() for r, c in history)
+            has_assistant = any(r == "assistant" for r, _ in history)
 
             if has_assistant:
-                streak = int(state["emotional_streak"] or 0)
+                streak = state["emotional_streak"]
 
                 if streak >= 7:
                     mode = "followup_escalation"
@@ -300,7 +308,11 @@ def ask_final(req: AskReq):
                 else:
                     mode = "followup"
 
-                forced_step = pick_step(req.conversation_id or "", streak, state.get("last_step"))
+                forced_step = pick_step(
+                    req.conversation_id or "",
+                    streak,
+                    state.get("last_step"),
+                )
 
         answer = build_gpt_answer(
             question=augmented_q,
@@ -311,19 +323,18 @@ def ask_final(req: AskReq):
         )
         used_gpt = True
 
-        if req.conversation_id:
-            if intent == "emotional" and forced_step:
-                save_state(req.conversation_id, int(state["emotional_streak"] or 0), forced_step)
-            else:
-                save_state(req.conversation_id, int(state["emotional_streak"] or 0), state.get("last_step"))
-
     if req.conversation_id:
         add_message(req.conversation_id, "assistant", answer)
+        save_state(
+            req.conversation_id,
+            state["emotional_streak"],
+            forced_step if intent == "emotional" else None,
+        )
 
     return {
         "answer": answer,
         "intent": intent,
         "used_gpt": used_gpt,
-        "mode": mode if intent != "unclear" else "fallback",
-        "emotional_streak": int(state["emotional_streak"] or 0) if req.conversation_id else None,
+        "mode": mode,
+        "emotional_streak": state["emotional_streak"],
     }
