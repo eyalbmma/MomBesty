@@ -2,6 +2,7 @@
 import os
 import time
 import sqlite3
+import json
 from typing import Optional, List, Tuple, Dict, Any
 
 from fastapi import FastAPI, HTTPException
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-15-state-lite-followup-locked"
+APP_VERSION = "render-test-16-state-lite-last3steps"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -60,7 +61,7 @@ class AskReq(BaseModel):
 from chat_engine import (
     build_augmented_question,
     build_gpt_answer,
-    build_followup_ack,  # NEW
+    build_followup_ack,
     topic_fallback,
 )
 
@@ -80,16 +81,24 @@ def ensure_schema():
     con = db_connect()
     cur = con.cursor()
 
+    # Create table if not exists (new installs)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS conversation_state (
           conversation_id TEXT PRIMARY KEY,
           emotional_streak INTEGER NOT NULL DEFAULT 0,
           last_step TEXT,
+          last_steps TEXT,
           updated_at INTEGER NOT NULL
         );
         """
     )
+
+    # Add column safely for existing DBs (SQLite has no IF NOT EXISTS for ADD COLUMN)
+    cur.execute("PRAGMA table_info(conversation_state);")
+    cols = {row[1] for row in cur.fetchall()}
+    if "last_steps" not in cols:
+        cur.execute("ALTER TABLE conversation_state ADD COLUMN last_steps TEXT;")
 
     cur.execute(
         """
@@ -153,12 +162,22 @@ ALLOWED_STEPS: List[str] = [
 ]
 
 
+def _parse_last_steps(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
 def get_state(conversation_id: str) -> Dict[str, Any]:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
         """
-        SELECT emotional_streak, last_step
+        SELECT emotional_streak, last_step, last_steps
         FROM conversation_state
         WHERE conversation_id = ?
         """,
@@ -168,39 +187,56 @@ def get_state(conversation_id: str) -> Dict[str, Any]:
     con.close()
 
     if not row:
-        return {"emotional_streak": 0, "last_step": None}
+        return {"emotional_streak": 0, "last_step": None, "last_steps": []}
 
     return {
         "emotional_streak": int(row["emotional_streak"] or 0),
         "last_step": row["last_step"],
+        "last_steps": _parse_last_steps(row["last_steps"]),
     }
 
 
-def save_state(conversation_id: str, emotional_streak: int, last_step: Optional[str]):
+def save_state(
+    conversation_id: str,
+    emotional_streak: int,
+    last_step: Optional[str],
+    last_steps: List[str],
+):
     ts = int(time.time())
+    last_steps_json = json.dumps(last_steps or [], ensure_ascii=False)
+
     con = db_connect()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO conversation_state(conversation_id, emotional_streak, last_step, updated_at)
-        VALUES(?,?,?,?)
+        INSERT INTO conversation_state(conversation_id, emotional_streak, last_step, last_steps, updated_at)
+        VALUES(?,?,?,?,?)
         ON CONFLICT(conversation_id) DO UPDATE SET
           emotional_streak=excluded.emotional_streak,
           last_step=excluded.last_step,
+          last_steps=excluded.last_steps,
           updated_at=excluded.updated_at
         """,
-        (conversation_id, emotional_streak, last_step, ts),
+        (conversation_id, emotional_streak, last_step, last_steps_json, ts),
     )
     con.commit()
     con.close()
 
 
-def pick_step(conversation_id: str, emotional_streak: int, last_step: Optional[str]) -> str:
-    idx = abs(hash(f"{conversation_id}:{emotional_streak}")) % len(ALLOWED_STEPS)
-    step = ALLOWED_STEPS[idx]
-    if last_step and step == last_step:
-        step = ALLOWED_STEPS[(idx + 1) % len(ALLOWED_STEPS)]
-    return step
+def pick_step(conversation_id: str, emotional_streak: int, last_steps: List[str]) -> str:
+    """
+    בוחר צעד בצורה דטרמיניסטית, אבל נמנע מלחזור על אחד מ-3 הצעדים האחרונים.
+    """
+    last_steps = last_steps or []
+    idx0 = abs(hash(f"{conversation_id}:{emotional_streak}")) % len(ALLOWED_STEPS)
+
+    for k in range(len(ALLOWED_STEPS)):
+        step = ALLOWED_STEPS[(idx0 + k) % len(ALLOWED_STEPS)]
+        if step not in last_steps:
+            return step
+
+    # fallback (נדיר)
+    return ALLOWED_STEPS[idx0]
 
 
 # =========================
@@ -212,7 +248,6 @@ def detect_intent(question: str) -> str:
     if len(q.split()) <= 2:
         return "unclear"
 
-    # physical קודם כדי לא להתנגש עם "מרגישה ..."
     if any(w in q for w in ["כואב", "חום", "דימום", "תפרים", "כאבים"]):
         return "physical"
 
@@ -248,11 +283,9 @@ def detect_intent(question: str) -> str:
     if any(w in q for w in emotional_phrases):
         return "emotional"
 
-    # "מרגישה" רק עם רגש ברור
     if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה"]):
         return "emotional"
 
-    # כלל "רגש/נפש/עומס"
     if any(x in q for x in ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת"]):
         return "emotional"
 
@@ -276,7 +309,7 @@ def ask_final(req: AskReq):
         raise HTTPException(status_code=400, detail="question is required")
 
     history: List[Tuple[str, str]] = []
-    state = {"emotional_streak": 0, "last_step": None}
+    state: Dict[str, Any] = {"emotional_streak": 0, "last_step": None, "last_steps": []}
 
     if req.conversation_id:
         history = get_recent_messages(req.conversation_id)
@@ -321,8 +354,13 @@ def ask_final(req: AskReq):
                 forced_step = pick_step(
                     req.conversation_id or "",
                     streak,
-                    state.get("last_step"),
+                    state.get("last_steps", []),
                 )
+
+                # update last_steps (keep last 3)
+                last_steps = list(state.get("last_steps", []))
+                last_steps.append(forced_step)
+                state["last_steps"] = last_steps[-3:]
 
         # ✅ FOLLOWUP נעול בשרת
         if mode in ("followup", "followup_checkin", "followup_escalation"):
@@ -337,7 +375,7 @@ def ask_final(req: AskReq):
 
             step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
             answer = f"{ack}\n{step_line}\n{closed_q}"
-            used_gpt = True  # השתמשנו ב-GPT למשפט אחד בלבד
+            used_gpt = True
 
         # FULL רגיל
         else:
@@ -356,6 +394,7 @@ def ask_final(req: AskReq):
             req.conversation_id,
             int(state["emotional_streak"] or 0),
             forced_step if intent == "emotional" else None,
+            state.get("last_steps", []),
         )
 
     return {
@@ -364,4 +403,6 @@ def ask_final(req: AskReq):
         "used_gpt": used_gpt,
         "mode": mode,
         "emotional_streak": state["emotional_streak"],
+        # אופציונלי לדיבוג:
+        # "last_steps": state.get("last_steps", []),
     }
