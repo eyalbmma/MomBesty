@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-13-state-lite-intent-fix"
+APP_VERSION = "render-test-14-state-lite-intent-fix2"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -212,11 +212,11 @@ def detect_intent(question: str) -> str:
     if len(q.split()) <= 2:
         return "unclear"
 
-    # physical קודם כדי לא להתנגש
+    # 1) physical קודם כדי לא להתנגש עם "מרגישה ..."
     if any(w in q for w in ["כואב", "חום", "דימום", "תפרים", "כאבים"]):
         return "physical"
 
-    # emotional ביטויים ברורים
+    # 2) emotional — ביטויים ברורים
     emotional_phrases = [
         "מוצפת",
         "קשה לי",
@@ -239,13 +239,21 @@ def detect_intent(question: str) -> str:
         "דיכאון",
         "חרדה",
         "מיואשת",
+        "מותשת",
+        "מותשת נפשית",
+        "עומס נפשי",
+        "לא מתפקדת",
+        "לא מתפקד",
     ]
-
     if any(w in q for w in emotional_phrases):
         return "emotional"
 
-    # צירופים חכמים
+    # ✅ המלצה 1: "מרגישה" רק עם רגש ברור (כבר היה)
     if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה"]):
+        return "emotional"
+
+    # ✅ המלצה 2: כלל "רגש/נפש/עומס" — תופס משפטים כמו "מותשת נפשית" גם אם ניסוח משתנה
+    if any(x in q for x in ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת"]):
         return "emotional"
 
     return "general"
@@ -289,6 +297,7 @@ def ask_final(req: AskReq):
         answer = topic_fallback(req.question)
         used_gpt = False
         mode = "fallback"
+        forced_step = None
 
     else:
         augmented_q = build_augmented_question(req.question, history)
