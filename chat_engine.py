@@ -14,7 +14,8 @@ HISTORY_LIMIT_TO_GPT = 4
 MAX_TOKENS = 320
 TEMPERATURE = 0.3
 
-PROMPT_VER = "v11-followup-locked-ack-only"
+# bump version so you can track prompt changes in logs/caching later
+PROMPT_VER = "v12-full-guardrail-no-journal-meditation-music"
 
 client = OpenAI()
 
@@ -85,7 +86,7 @@ def topic_fallback(question: str) -> str:
 
 
 # =========================
-# NEW: Followup ACK only (one short sentence)
+# Followup ACK only (one short sentence)
 # =========================
 def build_followup_ack(history: List[Tuple[str, str]]) -> str:
     """
@@ -158,13 +159,17 @@ def build_gpt_answer(
         ]
     )
 
+    # ✅ NEW: Guardrail for FULL
     system = (
         "את עוזרת לאימהות אחרי לידה. כתבי בעברית פשוטה, רגישה ולא שיפוטית.\n"
         "מבנה חובה:\n"
         "1) תיקוף רגשי קצר\n"
         "2) מה אפשר לעשות עכשיו (2–3 נקודות)\n"
         "3) מתי לפנות לבדיקה\n"
-        "4) שאלה אחת רק אם חסר פרט קריטי\n"
+        "4) שאלה אחת רק אם חסר פרט קריטי\n\n"
+        "כלל קשיח:\n"
+        "אל תציעי יומן רגשות, מדיטציה, מוזיקה או תרגולים כלליים.\n"
+        "תציעי רק צעדים פרקטיים קטנים ומיידיים ותמיכה רגשית ישירה.\n\n"
         "אל תאבחני ואל תתני טיפול רפואי."
     )
 
