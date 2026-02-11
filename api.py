@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-17-state-lite-intent-hardened"
+APP_VERSION = "render-test-18-force-redeploy"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
