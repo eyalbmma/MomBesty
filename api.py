@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "render-test-18-force-redeploy"
+APP_VERSION = "render-test-19-critical-layer"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
@@ -194,7 +194,12 @@ def get_state(conversation_id: str) -> Dict[str, Any]:
     }
 
 
-def save_state(conversation_id: str, emotional_streak: int, last_step: Optional[str], last_steps: List[str]):
+def save_state(
+    conversation_id: str,
+    emotional_streak: int,
+    last_step: Optional[str],
+    last_steps: List[str],
+):
     ts = int(time.time())
     last_steps_json = json.dumps(last_steps or [], ensure_ascii=False)
 
@@ -229,8 +234,50 @@ def pick_step(conversation_id: str, emotional_streak: int, last_steps: List[str]
 
 
 # =========================
-# Intent Router (מחוזק)
+# Critical safety detection (NEW)
 # =========================
+def is_critical_emotional(question: str) -> bool:
+    """
+    זיהוי מצוקה חריגה / סיכון מיידי (שכבת בטיחות).
+    בכוונה שמרני וקצר: בלי פירוט.
+    """
+    if not question:
+        return False
+
+    q = question.strip().lower()
+    q = q.replace("?", "").replace("!", "").replace(".", "").replace(",", "").replace(";", "")
+
+    critical_phrases = [
+        "אני מפחדת מעצמי",
+        "אני מפחד מעצמי",
+        "אני בסכנה",
+        "אני לא בטוחה",
+        "לא בטוחה",
+        "מחשבות קשות על עצמי",
+        "מחשבות קשות",
+        "חושבת לפגוע בעצמי",
+        "לפגוע בעצמי",
+        "לא רוצה להיות פה",
+        "אין לי טעם",
+        "אין טעם",
+    ]
+    return any(p in q for p in critical_phrases)
+
+
+def build_critical_answer(history: List[Tuple[str, str]]) -> str:
+    """
+    תשובה נעולה לשכבת בטיחות (בלי GPT).
+    """
+    ack = build_followup_ack(history) or "אני שומעת אותך."
+    return (
+        f"{ack}\n"
+        "זה נשמע כמו מצוקה חזקה, וחשוב לא להישאר עם זה לבד.\n"
+        "אם יש מישהו קרוב לידך עכשיו — עדיף לקרוא לו/לה להיות איתך.\n"
+        "וגם כדאי לפנות עכשיו לגורם מקצועי/מוקד רפואי או אחות טיפת חלב לייעוץ מיידי.\n"
+        "יש מישהו שיכול להיות איתך עכשיו? — כן / לא"
+    )
+
+
 # =========================
 # Intent Router (מחוזק)
 # =========================
@@ -238,24 +285,15 @@ def detect_intent(question: str) -> str:
     if not question:
         return "unclear"
 
-    # נירמול בסיסי
     q = question.strip().lower()
     q = q.replace("?", "").replace("!", "").replace(".", "").replace(",", "").replace(";", "")
 
-    # =========================
-    # 1️⃣ physical קודם
-    # =========================
-    physical_keywords = [
-        "כואב", "כאבים", "חום", "דימום", "תפרים",
-        "פצע", "הפרשות", "זיהום"
-    ]
+    # 1) physical קודם
+    physical_keywords = ["כואב", "כאבים", "חום", "דימום", "תפרים", "פצע", "הפרשות", "זיהום"]
     if any(w in q for w in physical_keywords):
         return "physical"
 
-    # =========================
-    # 2️⃣ short emotional BEFORE length check
-    # (כדי ש"אני מוצפת" לא ייפול ל-unclear)
-    # =========================
+    # 2) short emotional BEFORE length check
     short_emotional = [
         "מוצפת",
         "קשה לי",
@@ -276,47 +314,41 @@ def detect_intent(question: str) -> str:
     if any(w in q for w in short_emotional):
         return "emotional"
 
-    # עכשיו אפשר להחליט "unclear" על קצר שלא כולל מצוקה
     if len(q.split()) <= 2:
         return "unclear"
 
-    # =========================
-    # 3️⃣ emotional מלא
-    # =========================
+    # 3) emotional מלא
     emotional_keywords = [
-        "בוכה", "מפחדת", "לא עומדת",
-        "אומללה", "עצובה",
+        "בוכה",
+        "מפחדת",
+        "לא עומדת",
+        "אומללה",
+        "עצובה",
         "נגמרו לי הכוחות",
-        "מתוסכלת", "חסרת אונים",
+        "מתוסכלת",
+        "חסרת אונים",
         "מרגישה לבד",
-        "לא מצליחה להתמודד", "שבורה",
-        "מותשת", "מותשת נפשית", "עומס נפשי",
-        "לא משתפר", "גרוע לי",
-        "לא מסוגלת", "כמעט לא"
+        "לא מצליחה להתמודד",
+        "שבורה",
+        "מותשת",
+        "מותשת נפשית",
+        "עומס נפשי",
+        "לא משתפר",
+        "גרוע לי",
+        "לא מסוגלת",
+        "כמעט לא",
     ]
     if any(w in q for w in emotional_keywords):
         return "emotional"
 
-    # "מרגישה" רק עם רגש ברור
     if "מרגישה" in q and any(x in q for x in ["רע", "לבד", "עצובה", "אומללה", "נשברת"]):
         return "emotional"
 
-    # צירופים שליליים כלליים
-    negative_patterns = [
-        "לא מצליחה",
-        "כמעט לא מתפקדת",
-        "לא מתפקדת",
-        "לא עומדת",
-        "לא טוב",
-        "לא מסוגלת",
-    ]
+    negative_patterns = ["לא מצליחה", "כמעט לא מתפקדת", "לא מתפקדת", "לא עומדת", "לא טוב", "לא מסוגלת"]
     if any(p in q for p in negative_patterns):
         return "emotional"
 
-    # רמזים רכים למצוקה
-    soft_emotional_hints = [
-        "נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת", "לבד"
-    ]
+    soft_emotional_hints = ["נפש", "רגש", "עומס", "מתוסכל", "מותש", "מותשת", "לבד"]
     if any(w in q for w in soft_emotional_hints):
         return "emotional"
 
@@ -349,14 +381,35 @@ def ask_final(req: AskReq):
     if req.conversation_id:
         add_message(req.conversation_id, "user", req.question)
 
+    # ✅ Critical layer first (NEW)
+    if is_critical_emotional(req.question):
+        answer = build_critical_answer(history)
+        intent = "critical_emotional"
+        mode = "followup_critical"
+        used_gpt = False
+
+        if req.conversation_id:
+            # נשמור state בלי להעלות streak (לא “משחקים” פה עם צעדים)
+            save_state(req.conversation_id, int(state.get("emotional_streak") or 0), None, state.get("last_steps", []))
+            add_message(req.conversation_id, "assistant", answer)
+
+        return {
+            "answer": answer,
+            "intent": intent,
+            "used_gpt": used_gpt,
+            "mode": mode,
+            "emotional_streak": int(state.get("emotional_streak") or 0),
+        }
+
+    # רגיל
     intent = detect_intent(req.question)
 
     if req.conversation_id:
         if intent == "emotional":
-            state["emotional_streak"] += 1
+            state["emotional_streak"] = int(state.get("emotional_streak") or 0) + 1
         else:
             state["emotional_streak"] = 0
-            state["last_steps"] = []  # חשוב: מאפס רצף צעדים כשזה לא רגשי
+            state["last_steps"] = []  # מאפס רצף צעדים כשזה לא רגשי
 
     forced_step: Optional[str] = None
 
@@ -405,7 +458,6 @@ def ask_final(req: AskReq):
             step_line = forced_step or "לשבת/לשכב 2 דקות בלי משימות"
             answer = f"{ack}\n{step_line}\n{closed_q}"
             used_gpt = True
-
         else:
             answer = build_gpt_answer(
                 question=augmented_q,
