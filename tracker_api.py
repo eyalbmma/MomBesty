@@ -111,6 +111,12 @@ def _require(condition: bool, msg: str):
         raise HTTPException(status_code=400, detail=msg)
 
 
+def _normalize_baby_id(baby_id: Optional[str]) -> str:
+    # Normalize baby_id to ensure consistent querying (handles empty string/None)
+    norm = (baby_id or "default").strip()
+    return norm or "default"
+
+
 def _fetch_active_sleep(cur, user_id: str, baby_id: str):
     cur.execute(
         """
@@ -134,7 +140,9 @@ def start_sleep(payload: SleepStartRequest):
     con = db()
     cur = con.cursor()
 
-    active_rows = _fetch_active_sleep(cur, payload.user_id, payload.baby_id)
+    baby_id = _normalize_baby_id(payload.baby_id)
+
+    active_rows = _fetch_active_sleep(cur, payload.user_id, baby_id)
     if active_rows:
         con.close()
         raise HTTPException(status_code=400, detail="כבר קיימת שינה פעילה עבור המשתמש/תינוק")
@@ -148,7 +156,7 @@ def start_sleep(payload: SleepStartRequest):
         (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min, sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at)
         VALUES (?, ?, 'sleep', ?, NULL, NULL, NULL, NULL, ?, NULL, 1, ?, 'active', ?)
         """,
-        (payload.user_id, payload.baby_id, started_at, started_at, payload.note, created_at),
+        (payload.user_id, baby_id, started_at, started_at, payload.note, created_at),
     )
     con.commit()
     entry_id = cur.lastrowid
@@ -176,11 +184,17 @@ def stop_sleep(payload: SleepStopRequest):
     con = db()
     cur = con.cursor()
 
-    active_rows = _fetch_active_sleep(cur, payload.user_id, payload.baby_id)
+    baby_id = _normalize_baby_id(payload.baby_id)
+    active_rows = _fetch_active_sleep(cur, payload.user_id, baby_id)
     if len(active_rows) == 0:
+        print(f"[sleep_stop] No active sleep found for user={payload.user_id} baby_id={baby_id}")
         con.close()
         raise HTTPException(status_code=404, detail="לא נמצאה שינה פעילה לסגירה")
     if len(active_rows) > 1:
+        print(
+            f"[sleep_stop] Multiple active sleeps found for user={payload.user_id} baby_id={baby_id} "
+            f"ids={[r['id'] for r in active_rows]}"
+        )
         con.close()
         raise HTTPException(status_code=409, detail="נמצאו מספר שינות פעילות - נדרש טיפול ידני")
 
@@ -226,7 +240,7 @@ def stop_sleep(payload: SleepStopRequest):
 def get_active_sleep(user_id: str = Query(..., min_length=3), baby_id: str = Query("default")):
     con = db()
     cur = con.cursor()
-    rows = _fetch_active_sleep(cur, user_id, baby_id)
+    rows = _fetch_active_sleep(cur, user_id, _normalize_baby_id(baby_id))
     con.close()
 
     if not rows:
