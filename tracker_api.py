@@ -135,7 +135,7 @@ def _fetch_active_sleep(cur, user_id: str, baby_id: str):
     return cur.fetchall()
 
 
-@router.post("/sleep/start", response_model=EntryOut)
+@router.post("/sleep/start", response_model=ActiveSleepOut)
 def start_sleep(payload: SleepStartRequest):
     con = db()
     cur = con.cursor()
@@ -171,12 +171,32 @@ def start_sleep(payload: SleepStartRequest):
         (entry_id,),
     )
     row = cur.fetchone()
+
+    if row:
+        print(
+            "[sleep_start] Created sleep entry | "
+            f"id={row['id']} user_id={row['user_id']} baby_id={row['baby_id']} "
+            f"type={row['type']} status={row['status']} is_active_sleep={row['is_active_sleep']} "
+            f"sleep_started_at={row['sleep_started_at']} sleep_ended_at={row['sleep_ended_at']}"
+        )
+    else:
+        print(
+            "[sleep_start] Failed to read created sleep entry immediately after insert | "
+            f"user_id={payload.user_id} baby_id={baby_id}"
+        )
     con.close()
 
     if not row:
         raise HTTPException(status_code=500, detail="Failed to read created sleep entry")
 
-    return dict(row)
+    started_at = row["sleep_started_at"] or row["occurred_at"]
+    elapsed_seconds = 0 if started_at else None
+
+    return ActiveSleepOut(
+        has_active=True,
+        entry=dict(row) if row else None,
+        elapsed_seconds=elapsed_seconds,
+    )
 
 
 @router.post("/sleep/stop", response_model=EntryOut)
