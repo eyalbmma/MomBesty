@@ -186,8 +186,16 @@ def stop_sleep(payload: SleepStopRequest):
 
     baby_id = _normalize_baby_id(payload.baby_id)
     active_rows = _fetch_active_sleep(cur, payload.user_id, baby_id)
+    if active_rows:
+        print(
+            f"[sleep_stop] Found active rows for user={payload.user_id} baby_id={baby_id} "
+            f"ids={[r['id'] for r in active_rows]}"
+        )
     if len(active_rows) == 0:
-        print(f"[sleep_stop] No active sleep found for user={payload.user_id} baby_id={baby_id}")
+        print(
+            "[sleep_stop] No active sleep found | "
+            f"user_id={payload.user_id} baby_id={baby_id} type='sleep' is_active_sleep=1 status='active' sleep_ended_at IS NULL/ANY"
+        )
         con.close()
         raise HTTPException(status_code=404, detail="לא נמצאה שינה פעילה לסגירה")
     if len(active_rows) > 1:
@@ -240,7 +248,15 @@ def stop_sleep(payload: SleepStopRequest):
 def get_active_sleep(user_id: str = Query(..., min_length=3), baby_id: str = Query("default")):
     con = db()
     cur = con.cursor()
-    rows = _fetch_active_sleep(cur, user_id, _normalize_baby_id(baby_id))
+    baby_id_norm = _normalize_baby_id(baby_id)
+    rows = _fetch_active_sleep(cur, user_id, baby_id_norm)
+    if rows:
+        print(
+            f"[sleep_active] Found active rows for user={user_id} baby_id={baby_id_norm} "
+            f"ids={[r['id'] for r in rows]}"
+        )
+    else:
+        print(f"[sleep_active] No active rows for user={user_id} baby_id={baby_id_norm}")
     con.close()
 
     if not rows:
