@@ -83,6 +83,9 @@ class EntryOut(BaseModel):
     sleep_started_at: Optional[int]
     sleep_ended_at: Optional[int]
     is_active_sleep: int
+    pump_started_at: Optional[int]
+    pump_ended_at: Optional[int]
+    is_active_pump: int
     note: Optional[str]
 
     status: str
@@ -106,6 +109,12 @@ class ActiveSleepOut(BaseModel):
     elapsed_seconds: Optional[int] = None
 
 
+class ActivePumpOut(BaseModel):
+    has_active: bool
+    entry: Optional[EntryOut] = None
+    elapsed_seconds: Optional[int] = None
+
+
 def _require(condition: bool, msg: str):
     if not condition:
         raise HTTPException(status_code=400, detail=msg)
@@ -121,7 +130,9 @@ def _fetch_active_sleep(cur, user_id: str, baby_id: str):
     cur.execute(
         """
         SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
-               sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
         FROM tracker_entries
         WHERE user_id = ?
           AND baby_id = ?
@@ -129,6 +140,26 @@ def _fetch_active_sleep(cur, user_id: str, baby_id: str):
           AND status = 'active'
           AND is_active_sleep = 1
         ORDER BY sleep_started_at DESC, id DESC
+        """,
+        (user_id, baby_id),
+    )
+    return cur.fetchall()
+
+
+def _fetch_active_pump(cur, user_id: str, baby_id: str):
+    cur.execute(
+        """
+        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
+        FROM tracker_entries
+        WHERE user_id = ?
+          AND baby_id = ?
+          AND type = 'pump'
+          AND status = 'active'
+          AND is_active_pump = 1
+        ORDER BY pump_started_at DESC, id DESC
         """,
         (user_id, baby_id),
     )
@@ -153,8 +184,11 @@ def start_sleep(payload: SleepStartRequest):
     cur.execute(
         """
         INSERT INTO tracker_entries
-        (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min, sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at)
-        VALUES (?, ?, 'sleep', ?, NULL, NULL, NULL, NULL, ?, NULL, 1, ?, 'active', ?)
+        (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+         sleep_started_at, sleep_ended_at, is_active_sleep,
+         pump_started_at, pump_ended_at, is_active_pump,
+         note, status, created_at)
+        VALUES (?, ?, 'sleep', ?, NULL, NULL, NULL, NULL, ?, NULL, 1, NULL, NULL, 0, ?, 'active', ?)
         """,
         (payload.user_id, baby_id, started_at, started_at, payload.note, created_at),
     )
@@ -164,7 +198,9 @@ def start_sleep(payload: SleepStartRequest):
     cur.execute(
         """
         SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
-               sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
         FROM tracker_entries
         WHERE id = ?
         """,
@@ -249,7 +285,9 @@ def stop_sleep(payload: SleepStopRequest):
     cur.execute(
         """
         SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
-               sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
         FROM tracker_entries
         WHERE id = ?
         """,
@@ -280,17 +318,208 @@ def get_active_sleep(user_id: str = Query(..., min_length=3), baby_id: str = Que
     con.close()
 
     if not rows:
-        return ActiveSleepOut(has_active=False, entry=None, elapsed_seconds=None)
+        payload = ActiveSleepOut(has_active=False, entry=None, elapsed_seconds=None)
+        print(f"[sleep_active] response={payload.dict()}")
+        return payload
 
     active = rows[0]
     started_at = active["sleep_started_at"] or active["occurred_at"]
     elapsed_seconds = max(0, now_ts() - started_at) if started_at else None
 
-    return ActiveSleepOut(
+    payload = ActiveSleepOut(
         has_active=True,
         entry=dict(active),
         elapsed_seconds=elapsed_seconds,
     )
+    print(f"[sleep_active] response={payload.dict()}")
+    return payload
+
+
+# =========================
+# Pump active flow
+# =========================
+
+@router.post("/pump/start", response_model=ActivePumpOut)
+def start_pump(payload: SleepStartRequest):  # reuse fields: user_id, baby_id, note
+    con = db()
+    cur = con.cursor()
+
+    baby_id = _normalize_baby_id(payload.baby_id)
+
+    active_rows = _fetch_active_pump(cur, payload.user_id, baby_id)
+    if active_rows:
+        con.close()
+        raise HTTPException(status_code=400, detail="כבר קיימת שאיבה פעילה עבור המשתמש/תינוק")
+
+    started_at = now_ts()
+    created_at = started_at
+
+    cur.execute(
+        """
+        INSERT INTO tracker_entries
+        (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+         sleep_started_at, sleep_ended_at, is_active_sleep,
+         pump_started_at, pump_ended_at, is_active_pump,
+         note, status, created_at)
+        VALUES (?, ?, 'pump', ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?, NULL, 1, ?, 'active', ?)
+        """,
+        (payload.user_id, baby_id, started_at, started_at, payload.note, created_at),
+    )
+    con.commit()
+    entry_id = cur.lastrowid
+
+    cur.execute(
+        """
+        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
+        FROM tracker_entries
+        WHERE id = ?
+        """,
+        (entry_id,),
+    )
+    row = cur.fetchone()
+
+    if row:
+        print(
+            "[pump_start] Created pump entry | "
+            f"id={row['id']} user_id={row['user_id']} baby_id={row['baby_id']} "
+            f"type={row['type']} status={row['status']} is_active_pump={row['is_active_pump']} "
+            f"pump_started_at={row['pump_started_at']} pump_ended_at={row['pump_ended_at']}"
+        )
+    else:
+        print(
+            "[pump_start] Failed to read created pump entry immediately after insert | "
+            f"user_id={payload.user_id} baby_id={baby_id}"
+        )
+        con.close()
+        raise HTTPException(status_code=500, detail="Failed to read created pump entry")
+
+    con.close()
+
+    started_at_val = row["pump_started_at"] or row["occurred_at"]
+    elapsed_seconds = 0 if started_at_val else None
+
+    payload_resp = ActivePumpOut(
+        has_active=True,
+        entry=dict(row),
+        elapsed_seconds=elapsed_seconds,
+    )
+    print(f"[pump_start] response={payload_resp.dict()}")
+    return payload_resp
+
+
+@router.get("/pump/active", response_model=ActivePumpOut)
+def get_active_pump(user_id: str = Query(..., min_length=3), baby_id: str = Query("default")):
+    con = db()
+    cur = con.cursor()
+    baby_id_norm = _normalize_baby_id(baby_id)
+    rows = _fetch_active_pump(cur, user_id, baby_id_norm)
+    if rows:
+        print(
+            f"[pump_active] Found active rows for user={user_id} baby_id={baby_id_norm} "
+            f"ids={[r['id'] for r in rows]}"
+        )
+    else:
+        print(f"[pump_active] No active rows for user={user_id} baby_id={baby_id_norm}")
+    con.close()
+
+    if not rows:
+        payload = ActivePumpOut(has_active=False, entry=None, elapsed_seconds=None)
+        print(f"[pump_active] response={payload.dict()}")
+        return payload
+
+    active = rows[0]
+    started_at = active["pump_started_at"] or active["occurred_at"]
+    elapsed_seconds = max(0, now_ts() - started_at) if started_at else None
+
+    payload = ActivePumpOut(
+        has_active=True,
+        entry=dict(active),
+        elapsed_seconds=elapsed_seconds,
+    )
+    print(f"[pump_active] response={payload.dict()}")
+    return payload
+
+
+@router.post("/pump/stop", response_model=EntryOut)
+def stop_pump(payload: SleepStopRequest):  # reuse fields: user_id, baby_id
+    con = db()
+    cur = con.cursor()
+
+    baby_id = _normalize_baby_id(payload.baby_id)
+    active_rows = _fetch_active_pump(cur, payload.user_id, baby_id)
+    if active_rows:
+        print(
+            f"[pump_stop] Found active rows for user={payload.user_id} baby_id={baby_id} "
+            f"ids={[r['id'] for r in active_rows]}"
+        )
+    if len(active_rows) == 0:
+        print(
+            "[pump_stop] No active pump found | "
+            f"user_id={payload.user_id} baby_id={baby_id} type='pump' is_active_pump=1 status='active' pump_ended_at IS NULL/ANY"
+        )
+        con.close()
+        raise HTTPException(status_code=404, detail="לא נמצאה שאיבה פעילה לסגירה")
+    if len(active_rows) > 1:
+        print(
+            f"[pump_stop] Multiple active pumps found for user={payload.user_id} baby_id={baby_id} "
+            f"ids={[r['id'] for r in active_rows]}"
+        )
+        con.close()
+        raise HTTPException(status_code=409, detail="נמצאו מספר שאיבות פעילות - נדרש טיפול ידני")
+
+    active = active_rows[0]
+    started_at = active["pump_started_at"] or active["occurred_at"]
+    if not started_at:
+        con.close()
+        raise HTTPException(status_code=500, detail="Missing pump_started_at for active pump")
+
+    ended_at = now_ts()
+    duration_seconds = max(0, ended_at - started_at)
+    duration_min = int(duration_seconds // 60)
+
+    cur.execute(
+        """
+        UPDATE tracker_entries
+        SET pump_ended_at = ?, duration_min = ?, is_active_pump = 0
+        WHERE id = ?
+        """,
+        (ended_at, duration_min, active["id"]),
+    )
+    con.commit()
+
+    cur.execute(
+        """
+        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
+        FROM tracker_entries
+        WHERE id = ?
+        """,
+        (active["id"],),
+    )
+    row = cur.fetchone()
+    con.close()
+
+    if row:
+        print(
+            "[pump_stop] Updated pump entry | "
+            f"id={row['id']} user_id={row['user_id']} baby_id={row['baby_id']} "
+            f"type={row['type']} status={row['status']} is_active_pump={row['is_active_pump']} "
+            f"pump_started_at={row['pump_started_at']} pump_ended_at={row['pump_ended_at']} duration_min={row['duration_min']}"
+        )
+    else:
+        print(
+            "[pump_stop] Failed to read updated pump entry | "
+            f"user_id={payload.user_id} baby_id={baby_id}"
+        )
+        raise HTTPException(status_code=500, detail="Failed to read stopped pump entry")
+
+    return dict(row)
+
 
 @router.post("/entries", response_model=EntryOut)
 def create_entry(payload: EntryCreate):
@@ -338,8 +567,11 @@ def create_entry(payload: EntryCreate):
     cur.execute(
         """
         INSERT INTO tracker_entries
-        (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min, sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?)
+        (user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+         sleep_started_at, sleep_ended_at, is_active_sleep,
+         pump_started_at, pump_ended_at, is_active_pump,
+         note, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, 'active', ?)
         """,
         (
             payload.user_id,
@@ -352,6 +584,8 @@ def create_entry(payload: EntryCreate):
             payload.duration_min,
             None,
             None,
+            None,
+            None,
             payload.note,
             created_at,
         ),
@@ -361,7 +595,10 @@ def create_entry(payload: EntryCreate):
 
     cur.execute(
         """
-        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min, sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at
+        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
         FROM tracker_entries
         WHERE id = ?
         """,
@@ -403,7 +640,10 @@ def list_entries(
 
     where_sql = " AND ".join(clauses)
     sql = f"""
-        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min, sleep_started_at, sleep_ended_at, is_active_sleep, note, status, created_at
+        SELECT id, user_id, baby_id, type, occurred_at, method, amount_ml, diaper_kind, duration_min,
+               sleep_started_at, sleep_ended_at, is_active_sleep,
+               pump_started_at, pump_ended_at, is_active_pump,
+               note, status, created_at
         FROM tracker_entries
         WHERE {where_sql}
         ORDER BY occurred_at DESC, id DESC

@@ -21,6 +21,9 @@ def main():
         sleep_started_at INTEGER,        -- שעת התחלת שינה (epoch seconds)
         sleep_ended_at INTEGER,          -- שעת סיום שינה (epoch seconds)
         is_active_sleep INTEGER NOT NULL DEFAULT 0, -- 1=שינה פעילה
+        pump_started_at INTEGER,         -- שעת התחלת שאיבה (epoch seconds)
+        pump_ended_at INTEGER,           -- שעת סיום שאיבה (epoch seconds)
+        is_active_pump INTEGER NOT NULL DEFAULT 0, -- 1=שאיבה פעילה
 
         note TEXT,
         status TEXT NOT NULL DEFAULT 'active',
@@ -34,6 +37,9 @@ def main():
         "ALTER TABLE tracker_entries ADD COLUMN sleep_started_at INTEGER",
         "ALTER TABLE tracker_entries ADD COLUMN sleep_ended_at INTEGER",
         "ALTER TABLE tracker_entries ADD COLUMN is_active_sleep INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tracker_entries ADD COLUMN pump_started_at INTEGER",
+        "ALTER TABLE tracker_entries ADD COLUMN pump_ended_at INTEGER",
+        "ALTER TABLE tracker_entries ADD COLUMN is_active_pump INTEGER NOT NULL DEFAULT 0",
     ]
     for stmt in alter_statements:
         try:
