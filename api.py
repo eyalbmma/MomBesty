@@ -1,4 +1,5 @@
 # api.py
+import logging
 import os
 import time
 import sqlite3
@@ -64,11 +65,14 @@ from chat_engine import (
     build_followup_ack,
     topic_fallback,
 )
+from rag_retrieval import build_rag_context_from_rag_clean
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # DB
 # =========================
-DB_PATH = "/data/rag.db"
+DB_PATH = "data/rag.db"
 
 
 def db_connect():
@@ -459,12 +463,26 @@ def ask_final(req: AskReq):
             answer = f"{ack}\n{step_line}\n{closed_q}"
             used_gpt = True
         else:
+            logger.info("ask_final RAG sqlite path=%s", os.path.abspath(DB_PATH))
+            rag_context = ""
+            rag_verbatim = None
+            con_rag = db_connect()
+            try:
+                rag_context, rag_verbatim = build_rag_context_from_rag_clean(
+                    con_rag,
+                    augmented_q,
+                    client,
+                    db_path_abs=os.path.abspath(DB_PATH),
+                )
+            finally:
+                con_rag.close()
             answer = build_gpt_answer(
                 question=augmented_q,
                 history=history,
-                context="",
+                context=rag_context,
                 mode=mode,
                 forced_step=None,
+                rag_verbatim_phrase=rag_verbatim,
             )
             used_gpt = True
 

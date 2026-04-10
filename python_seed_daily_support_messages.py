@@ -2,7 +2,7 @@ import sqlite3
 import time
 from typing import List, Dict, Any
 
-DB_PATH = "/data/rag.db"  # שנה אם צריך
+DB_PATH = "data/rag.db"  # שנה אם צריך
 
 def now_ts() -> int:
     return int(time.time())

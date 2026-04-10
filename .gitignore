@@ -1,28 +1,44 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
 
-# SQLite – ignore all databases
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# SQLite / DB
 *.db
 *.db-wal
 *.db-shm
 
+# Logs
+*.log
 
-# Data / exports
-*.csv
-*.json
-*.txt
+# OS
+.DS_Store
+Thumbs.db
 
-# One-off scripts (אם לא רוצים לעלות)
+# IDE
+.vscode/
+.idea/
+
+# Temp / debug scripts
 scrape_*.py
 generate_*.py
 *_dump.py
 backup*.db
+tmp/
+temp/
 
-# OS
-.DS_Store
-
-
-
-# SQL dumps (may contain sensitive data)
+# Optional: SQL dumps (only if they contain data)
 *.sql
+
+
+# Data files (do NOT upload)
+*.json
+*.csv

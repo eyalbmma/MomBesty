@@ -1,15 +1,20 @@
 import os
-import os
-from pydantic import BaseModel, Field
 import sqlite3
 import time
 from typing import Optional, List, Dict, Any
 
+from fastapi import APIRouter, HTTPException, Query, Header
+from pydantic import BaseModel, Field
 
-from fastapi import APIRouter, HTTPException, Query
-
-DB_PATH = "/data/rag.db"
+DB_PATH = "data/rag.db"
 router = APIRouter(prefix="/circles", tags=["circles"])
+
+CIRCLES_ADMIN_KEY = os.getenv("CIRCLES_ADMIN_KEY")
+if not CIRCLES_ADMIN_KEY:
+    raise RuntimeError("Missing required environment variable: CIRCLES_ADMIN_KEY")
+
+ADMIN_SEED_KEY = CIRCLES_ADMIN_KEY
+ADMIN_KEY = CIRCLES_ADMIN_KEY
 
 
 def db():
@@ -30,14 +35,12 @@ def _load_pro_meta(con: sqlite3.Connection, pro_ids: List[str]) -> Dict[str, Dic
     cur = con.cursor()
     placeholders = ",".join(["?"] * len(pro_ids))
 
-    # categories
     cur.execute(
         f"SELECT pro_id, category FROM circles_pro_categories WHERE pro_id IN ({placeholders})",
         pro_ids,
     )
     cat_rows = cur.fetchall()
 
-    # areas
     cur.execute(
         f"SELECT pro_id, area_id FROM circles_pro_areas WHERE pro_id IN ({placeholders})",
         pro_ids,
@@ -137,7 +140,6 @@ def list_pros(
         elif mode is not None:
             raise HTTPException(status_code=400, detail="mode must be online|inPerson")
 
-        # Filtering by area/category via EXISTS to avoid duplicates
         if area_id:
             where.append(
                 "EXISTS (SELECT 1 FROM circles_pro_areas pa WHERE pa.pro_id=p.id AND pa.area_id=?)"
@@ -353,11 +355,6 @@ def list_events(
         con.close()
 
 
-
-from fastapi import Header
-
-ADMIN_SEED_KEY = os.getenv("CIRCLES_ADMIN_KEY", "change-me")
-
 @router.post("/admin/seed")
 def admin_seed(x_admin_key: str = Header(default="")):
     if x_admin_key != ADMIN_SEED_KEY:
@@ -368,7 +365,6 @@ def admin_seed(x_admin_key: str = Header(default="")):
         cur = con.cursor()
         ts = now_ts()
 
-        # 1) Areas
         cur.executemany(
             "INSERT OR IGNORE INTO circles_areas(id, name, order_index) VALUES(?,?,?)",
             [
@@ -383,7 +379,6 @@ def admin_seed(x_admin_key: str = Header(default="")):
             ],
         )
 
-        # 2) Pros
         cur.executemany(
             """
             INSERT OR IGNORE INTO circles_pros(
@@ -419,7 +414,6 @@ def admin_seed(x_admin_key: str = Header(default="")):
             ],
         )
 
-        # 3) Groups
         cur.executemany(
             """
             INSERT OR IGNORE INTO circles_groups(
@@ -442,7 +436,6 @@ def admin_seed(x_admin_key: str = Header(default="")):
             ],
         )
 
-        # 4) Events
         cur.executemany(
             """
             INSERT OR IGNORE INTO circles_events(
@@ -470,11 +463,10 @@ def admin_seed(x_admin_key: str = Header(default="")):
     finally:
         con.close()
 
+
 # =========================
 # Admin auth
 # =========================
-ADMIN_KEY = os.getenv("CIRCLES_ADMIN_KEY", "change-me")
-
 def _require_admin(x_admin_key: str):
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -484,7 +476,7 @@ def _require_admin(x_admin_key: str):
 # Admin Models (Pros)
 # =========================
 class ProCreateReq(BaseModel):
-    id: str = Field(..., min_length=2, max_length=64)   # למשל "pro5"
+    id: str = Field(..., min_length=2, max_length=64)
     name: str = Field(..., min_length=2, max_length=120)
     shortBio: str | None = None
     isOnline: bool = False
@@ -504,7 +496,7 @@ class ProPatchReq(BaseModel):
     phoneWhatsApp: str | None = None
     websiteUrl: str | None = None
     instagramUrl: str | None = None
-    isActive: bool | None = None  # אופציונלי
+    isActive: bool | None = None
 
 
 class ProSetListReq(BaseModel):
@@ -549,7 +541,6 @@ def _normalize_list(xs: list[str]) -> list[str]:
 # =========================
 # Admin Endpoints (Pros)
 # =========================
-
 @router.post("/admin/pros")
 def admin_create_pro(req: ProCreateReq, x_admin_key: str = Header(default="")):
     _require_admin(x_admin_key)
@@ -568,7 +559,6 @@ def admin_create_pro(req: ProCreateReq, x_admin_key: str = Header(default="")):
     try:
         cur = con.cursor()
 
-        # אין כפילויות
         if _pro_exists(con, pro_id):
             raise HTTPException(status_code=409, detail="pro id already exists")
 
@@ -598,14 +588,12 @@ def admin_create_pro(req: ProCreateReq, x_admin_key: str = Header(default="")):
             ),
         )
 
-        # categories
         if categories:
             cur.executemany(
                 "INSERT OR IGNORE INTO circles_pro_categories(pro_id, category) VALUES(?,?)",
                 [(pro_id, c) for c in categories],
             )
 
-        # areas
         if area_ids:
             cur.executemany(
                 "INSERT OR IGNORE INTO circles_pro_areas(pro_id, area_id) VALUES(?,?)",
@@ -614,7 +602,6 @@ def admin_create_pro(req: ProCreateReq, x_admin_key: str = Header(default="")):
 
         con.commit()
 
-        # החזרה בפורמט של ה-GET
         meta = _load_pro_meta(con, [pro_id]).get(pro_id, {"categories": [], "areaIds": []})
         return {
             "ok": True,
@@ -688,13 +675,11 @@ def admin_patch_pro(pro_id: str, req: ProPatchReq, x_admin_key: str = Header(def
             fields.append("is_active=?")
             params.append(1 if req.isActive else 0)
 
-        # nothing to update
         if not fields:
             return {"ok": True, "updated": False}
 
         fields.append("updated_at=?")
         params.append(now_ts())
-
         params.append(pro_id)
 
         cur.execute(
@@ -703,7 +688,6 @@ def admin_patch_pro(pro_id: str, req: ProPatchReq, x_admin_key: str = Header(def
         )
         con.commit()
 
-        # החזרה בפורמט GET
         cur.execute(
             """
             SELECT id,name,short_bio,is_online,is_in_person,phone_whatsapp,website_url,instagram_url,is_active
@@ -748,7 +732,6 @@ def admin_set_pro_categories(pro_id: str, req: ProSetListReq, x_admin_key: str =
         if not _pro_exists(con, pro_id):
             raise HTTPException(status_code=404, detail="Pro not found")
 
-        # replace-all
         cur.execute("DELETE FROM circles_pro_categories WHERE pro_id=?", (pro_id,))
         if categories:
             cur.executemany(
@@ -780,7 +763,6 @@ def admin_set_pro_areas(pro_id: str, req: ProSetListReq, x_admin_key: str = Head
 
         _assert_areas_exist(con, area_ids)
 
-        # replace-all
         cur.execute("DELETE FROM circles_pro_areas WHERE pro_id=?", (pro_id,))
         if area_ids:
             cur.executemany(
@@ -810,7 +792,6 @@ def admin_delete_pro(pro_id: str, x_admin_key: str = Header(default="")):
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pro not found")
 
-        # soft delete
         cur.execute(
             "UPDATE circles_pros SET is_active=0, updated_at=? WHERE id=?",
             (now_ts(), pro_id),

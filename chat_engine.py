@@ -151,6 +151,7 @@ def build_gpt_answer(
     context: str,
     mode: str = "full",  # נשאר לתאימות
     forced_step: Optional[str] = None,  # נשאר לתאימות
+    rag_verbatim_phrase: Optional[str] = None,
 ) -> str:
     history_text = "\n".join(
         [
@@ -171,14 +172,38 @@ def build_gpt_answer(
         "אל תציעי כתיבה/רישום/יומן/רשימות (כולל 'לכתוב מה מטריד אותך').\n"
         "אל תציעי מדיטציה, מוזיקה או תרגולי נשימה/מיינדפולנס כלליים.\n"
         "תציעי רק צעדים פרקטיים קטנים ומיידיים ותמיכה רגשית ישירה.\n\n"
-
     )
+    if (context or "").strip():
+        system += (
+            "מידע חובה מהמאגר:\n"
+            "כאשר מופיע למטה ב\"מידע מהמאגר\" טקסט רלוונטי לשאלה — חובה לבסס עליו את התשובה.\n"
+            "אם יש בו ניסוח ספציפי (מספרים, קודים, שמות, ניסוח ייחודי) — הכלל אותו בתשובה באופן ברור.\n"
+            "אסור לתת תשובה גנרית שמתעלמת ממידע ספציפי מהמאגר כשהוא עונה ישירות על השאלה.\n\n"
+        )
+
+    max_out = MAX_TOKENS
+    temp = TEMPERATURE
+    if rag_verbatim_phrase and rag_verbatim_phrase.strip():
+        system += (
+            "מצב דיוק מאגר מחמיר (הופעל רק כשההתאמה לשאלה כמעט מלאה ויש קוד/מזהה ארוך בתשובת המקור):\n"
+            "יש \"משפט חובה מהמאגר\" למטה. חובה להופיע בתשובתך **זהה תו-תו** (כולל מספרים, מקפים, אותיות באנגלית אם יש).\n"
+            "סדר מומלץ: עד משפט תמיכה קצר אחד (מקסימום ~12 מילים), ואז **מיד** בשורה נפרדת המשפט החובה במלואו — בלי פרפרז, בלי תיקון דקדוק, בלי החלפת מילים.\n"
+            "אם לא תכללי את המשפט החובה כפי שהוא — התשובה נחשבת שגויה.\n\n"
+        )
+        max_out = max(MAX_TOKENS, 520)
+        temp = min(TEMPERATURE, 0.15)
 
     user = (
         f"שאלה: {question}\n"
         f"הקשר קודם:\n{history_text or 'אין'}\n\n"
         f"מידע מהמאגר:\n{context}\n"
     )
+    if rag_verbatim_phrase and rag_verbatim_phrase.strip():
+        v = rag_verbatim_phrase.strip()
+        user += (
+            "\nמשפט חובה מהמאגר — להעתיק כך בדיוק (שורה מלאה אחת או יותר, ללא שינוי):\n"
+            f"<<<{v}>>>\n"
+        )
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -186,8 +211,8 @@ def build_gpt_answer(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
+        temperature=temp,
+        max_tokens=max_out,
     )
 
     return resp.choices[0].message.content or ""

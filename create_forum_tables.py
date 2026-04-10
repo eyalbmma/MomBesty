@@ -1,7 +1,7 @@
 import sqlite3
 import time
 
-DB_PATH = "/data/rag.db"
+DB_PATH = "data/rag.db"
 
 def db_connect():
     return sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)

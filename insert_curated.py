@@ -2,7 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-DB_PATH = r"C:\Project\babys\rag.db"
+DB_PATH = "data/rag.db"
 JSON_PATH = r"C:\Project\babys\input_368_390.json"
 
 print("Using DB:", DB_PATH)

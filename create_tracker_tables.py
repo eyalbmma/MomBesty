@@ -1,6 +1,6 @@
 import sqlite3
 
-DB_PATH = "/data/rag.db"
+DB_PATH = "data/rag.db"
 
 def main():
     con = sqlite3.connect(DB_PATH)

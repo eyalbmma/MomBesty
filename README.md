@@ -97,7 +97,7 @@ FastAPI (api.py)
 | Circles API (Admin + Public) |  
 ---------------------------------  
         ↓  
-SQLite DB (/data/rag.db)
+SQLite DB (`data/rag.db`, relative to process working directory)
 
 ---
 
@@ -152,11 +152,11 @@ pip install beautifulsoup4 playwright
 ## 🗄️ Database Setup
 
 Default path in code:
-/data/rag.db
+`data/rag.db`
 
 You can:
-- Create the directory manually  
-- Or update DB_PATH in the code  
+- Create the `data` directory manually (e.g. `mkdir data` from the project root) before first run  
+- Or update `DB_PATH` in each module if you need a different location  
 
 Run setup scripts:
 

@@ -20,7 +20,7 @@ Use this before making the repository public or widely sharing it. Items are ord
 
 | Issue | Why it matters | File(s) | Recommended fix |
 |--------|----------------|---------|-------------------|
-| Hardcoded Windows absolute paths | Breaks other machines; exposes your local layout | `insert_curated.py` (`DB_PATH`, `JSON_PATH`) | Use environment variables or paths relative to the repo / `pathlib` with documented defaults. |
+| Hardcoded paths for non-DB inputs | Breaks other machines; exposes your local layout | `insert_curated.py` (`JSON_PATH`) | Use environment variables or paths relative to the repo / `pathlib` with documented defaults. |
 | Duplicate or broken module | Confuses contributors and tooling; may be imported by mistake | `daily_support_repo.py` (references `now_ts`, `compute_day_index` without defining/importing them) | **Delete** the file or merge into `daily_support_plan.py` and fix imports; grep the repo to ensure nothing imports it. |
 | Stray editor artifact | Noise and unprofessional in a public repo | `Untitled` | Delete the file. |
 | Push token prefixes and full token lists logged | Logs often leave the host; tokens are credentials | `forum_api.py` (`[PUSH_TOKEN]`, `[PUSH_DEBUG]` prints including `tokens={tokens}`) | Log only non-sensitive metadata (e.g. user id hash, token count); redact or remove token substrings from logs in production. |
@@ -35,7 +35,7 @@ Use this before making the repository public or widely sharing it. Items are ord
 
 | Issue | Why it matters | File(s) | Recommended fix |
 |--------|----------------|---------|-------------------|
-| Hardcoded SQLite path `/data/rag.db` | Local dev and OSS users must edit many files | `api.py`, `content_api.py`, `forum_api.py`, `tracker_api.py`, `circles_api.py`, `embed_db.py`, `create_*_tables.py`, etc. | Centralize `DB_PATH` via one module or `os.getenv("DATABASE_PATH", "/data/rag.db")` and document in README. |
+| `DB_PATH` duplicated in many files | Drift risk if one file is updated and others are not | `api.py`, `content_api.py`, `forum_api.py`, `tracker_api.py`, `circles_api.py`, `embed_db.py`, `create_*_tables.py`, etc. | Centralize `DB_PATH` in one module or `os.getenv("DATABASE_PATH", "data/rag.db")` and document in README. |
 | OpenAPI UI exposed by default | Expands attack surface and documents internal routes | FastAPI defaults on `api.py` | In production, disable or restrict `/docs`, `/redoc`, `/openapi.json` (middleware or `FastAPI(docs_url=None, ...)` when `ENV=production`). |
 | Python version not pinned | CI and contributors may hit subtle incompatibilities | *(missing)* | Add `.python-version` or state `requires-python` in `pyproject.toml` if you adopt one. |
 | RAG tables and `embed_db.py` unused by live chat | Confusion about what the product actually does | `api.py`, `embed_db.py`, `rag_clean` | Either **document** “offline only” (README already does) or implement retrieval in `/ask_final`; alternatively trim unused tables/scripts from the public repo if you want a minimal story. |
