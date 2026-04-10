@@ -21,3 +21,8 @@ backup*.db
 
 # OS
 .DS_Store
+
+
+
+# SQL dumps (may contain sensitive data)
+*.sql
