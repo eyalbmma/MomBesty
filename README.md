@@ -1,249 +1,229 @@
-# Postpartum Support API
+# 🧠 Babys AI – RAG-Powered Parenting Assistant
 
-AI-powered backend for a postpartum support platform, combining conversational guidance, structured content, community interaction, and real-time tracking for new parents.
-
-This project powers a Hebrew-language application designed to support mothers during the postpartum period through personalized responses, educational content, and social features.
+A production-oriented AI backend that combines **LLM reasoning with Retrieval-Augmented Generation (RAG)** to deliver accurate, context-aware answers for parenting and baby-care scenarios.
 
 ---
 
 ## 🚀 Overview
 
-This is a **FastAPI-based backend** built around a modular architecture, integrating:
+This project implements a **FastAPI-based AI system** that:
 
-- 🤖 AI chat (OpenAI-powered)
-- 📚 Structured content (topics & articles)
-- 💬 Community forum (posts, comments, empathy)
-- 📊 Baby & mother tracking (sleep, feeding, pumping, etc.)
-- 🌐 "Circles" directory (professionals, groups, events)
-- 🔔 Push notifications (Expo)
-- 🧠 Embedding pipeline (for future RAG capabilities)
-
-The system is currently designed as a **single-service backend** using **SQLite**, with optional scripts for data enrichment and daily engagement workflows.
+* Accepts user questions via `/ask_final`
+* Retrieves relevant knowledge from a structured dataset (`rag_clean`)
+* Uses semantic similarity (embeddings + cosine similarity)
+* Injects retrieved context into an LLM (OpenAI)
+* Produces grounded, empathetic responses in Hebrew
 
 ---
 
-## ✨ Key Features
+## 🧩 Key Features
 
-### 🤖 AI Chat
-- Endpoint: `POST /ask_final`
-- Intent detection & safety handling
-- Conversation memory via `conversation_id`
-- Uses OpenAI (`gpt-4o-mini`)
-- Designed for emotional + informational postpartum support
+### 🔎 Retrieval-Augmented Generation (RAG)
 
-> ⚠️ Note: RAG infrastructure exists but is not currently connected to the live chat flow.
+* Local SQLite knowledge base (`rag_clean`)
+* Precomputed embeddings (`text-embedding-3-small`)
+* Real-time similarity search (cosine)
+* Top-K context injection into LLM
 
----
+### 🤖 LLM Integration
 
-### 📚 Content API
-- Topics & articles management
-- Search via SQL (`LIKE`)
-- Structured educational content
+* OpenAI GPT-based response generation
+* Context-aware answers
+* Controlled tone (empathetic + structured)
 
----
+### ⚡ Backend API
 
-### 💬 Forum
-- Create posts & comments
-- Empathy (likes)
-- Reporting system
-- Notifications & unread count
-- Expo push integration
+* Built with **FastAPI**
+* Main endpoint: `/ask_final`
+* Clean separation of concerns:
 
----
+  * `api.py` → routing
+  * `rag_retrieval.py` → retrieval logic
+  * `chat_engine.py` → LLM orchestration
 
-### 📊 Tracker
-Track baby and postpartum activities:
-- Feeding
-- Sleep (start/stop sessions)
-- Pumping
-- Diapers
-- Medicine
+### 🧠 Intelligent Context Handling
+
+* Dynamic context construction
+* Prioritization of top-ranked results
+* Token-preserving behavior (for codes, IDs)
 
 ---
 
-### 🌐 Circles
-- Professionals directory
-- Support groups
-- Events
-- Admin CRUD endpoints (secured via header key)
+## 🏗️ Architecture
+
+```
+User Question
+     ↓
+Embedding (query)
+     ↓
+Semantic Search (rag_clean)
+     ↓
+Top-K Results
+     ↓
+Context Builder
+     ↓
+LLM (GPT)
+     ↓
+Final Answer
+```
 
 ---
 
-### 🔔 Daily Support Engine (Scripts)
-- Generates daily support plans
-- Sends push notifications
-- Based on postpartum profiles & predefined messages
+## 📂 Project Structure
+
+```
+.
+├── api.py                    # FastAPI entry point
+├── chat_engine.py           # LLM logic and prompt building
+├── rag_retrieval.py         # RAG retrieval + similarity
+├── embed_db.py              # Embedding generation for DB
+├── forum_api.py             # Forum-related logic
+├── content_api.py           # Content endpoints
+├── tracker_api.py           # Tracking features
+├── create_*_tables.py       # DB schema scripts
+├── insert_curated.py        # Data insertion utilities
+├── README.md
+├── .gitignore
+```
 
 ---
 
-### 🧠 Embeddings & RAG (Planned)
-- Embeddings stored in `rag_clean`
-- Batch processing via `embed_db.py`
-- Not yet connected to `/ask_final`
+## ⚙️ Setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/<your-username>/<repo-name>.git
+cd <repo-name>
+```
 
 ---
 
-## 🧱 Architecture
+### 2. Create virtual environment
 
-Client (Mobile / Web)  
-        ↓  
-FastAPI (api.py)  
-        ↓  
----------------------------------  
-| Chat Engine (OpenAI)          |  
-| Content API (SQLite)          |  
-| Forum API + Push (Expo)       |  
-| Tracker API                  |  
-| Circles API (Admin + Public) |  
----------------------------------  
-        ↓  
-SQLite DB (`data/rag.db`, relative to process working directory)
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
 
 ---
 
-## 📁 Project Structure
+### 3. Install dependencies
 
-api.py                 # Main FastAPI app  
-chat_engine.py         # AI chat logic  
-content_api.py         # Content routes  
-forum_api.py           # Forum routes  
-tracker_api.py         # Tracking logic  
-circles_api.py         # Circles + admin  
-push_utils.py          # Expo push logic  
-
-embed_db.py            # Embedding pipeline  
-daily_support_plan.py  # Daily plan logic  
-daily_support_sender.py # Push execution  
-
-create_*_tables.py     # DB setup scripts  
-
-rag.db.sql             # ⚠️ DB export (review before publishing)
+```bash
+pip install -r requirements.txt
+```
 
 ---
 
-## ⚙️ Environment Variables
+### 4. Environment variables
 
-| Variable | Description |
-|----------|------------|
-| OPENAI_API_KEY | Required for chat & embeddings |
-| CIRCLES_ADMIN_KEY | Required for admin routes |
+Create a `.env` file:
 
----
-
-## 🛠️ Local Setup
-
-git clone <repo>  
-cd project  
-python -m venv venv  
-
-Windows:
-venv\Scripts\activate  
-
-Mac/Linux:
-source venv/bin/activate  
-
-pip install fastapi uvicorn pydantic openai requests  
-
-(Optional)  
-pip install beautifulsoup4 playwright  
+```env
+OPENAI_API_KEY=your_openai_api_key
+CIRCLES_ADMIN_KEY=your_secure_admin_key
+```
 
 ---
 
-## 🗄️ Database Setup
+### 5. Run the server
 
-Default path in code:
-`data/rag.db`
+```bash
+uvicorn api:app --reload
+```
 
-You can:
-- Create the `data` directory manually (e.g. `mkdir data` from the project root) before first run  
-- Or update `DB_PATH` in each module if you need a different location  
+Open Swagger:
 
-Run setup scripts:
-
-python create_content_tables.py  
-python create_forum_tables.py  
-python create_tracker_tables.py  
+```
+http://127.0.0.1:8000/docs
+```
 
 ---
 
-## ▶️ Running the API
+## 🔬 RAG Pipeline
 
-uvicorn api:app --reload --host 0.0.0.0 --port 8000  
+### Data Source
 
-Docs:
-http://localhost:8000/docs  
-http://localhost:8000/redoc  
+* Table: `rag_clean`
+* Fields:
+
+  * `question`
+  * `answer`
+  * `embedding`
+  * `source`, `tags`, `is_active`
+
+### Embedding Generation
+
+```bash
+python embed_db.py
+```
 
 ---
 
-## 🔌 API Example
+## 🧪 Example Request
 
-Request:
-
+```json
 POST /ask_final
 
 {
-  "question": "אני עייפה כל הזמן אחרי הלידה, זה נורמלי?",
-  "conversation_id": "abc123"
+  "question": "הבת שלי בת חודש וחצי ומראה סימני רעב",
+  "user_id": "test-user-1",
+  "conversation_id": "test-1"
 }
-
-Response:
-
-{
-  "answer": "...",
-  "intent": "emotional_support",
-  "used_gpt": true
-}
+```
 
 ---
 
-## 🔐 Security Notes
+## 📈 What Makes This Project Stand Out
 
-⚠️ Important before production use:
-
-- No authentication system (user_id is client-controlled)
-- Admin routes use x-admin-key
-- Debug endpoint exposes push tokens (/forum/debug/push-tokens)
-- Remove or secure sensitive endpoints before deployment
-- Do NOT commit real database files or user data
-
----
-
-## ⚠️ Disclaimer
-
-This system is NOT a medical device and does not replace professional medical advice.
+✔ Real RAG (not prompt-only AI)
+✔ End-to-end pipeline: retrieval → reasoning → response
+✔ Production-aware design (logging, fallback, env separation)
+✔ Clean architecture separation
+✔ Hebrew NLP + real-world domain (parenting)
+✔ Debugging + validation methodology (top-K verification)
 
 ---
 
-## 🚧 Future Improvements
+## 🔐 Security & Best Practices
 
-- Connect RAG to /ask_final  
-- Add authentication (JWT / OAuth)  
-- Move to PostgreSQL for scalability  
-- Add background workers (Celery / Redis)  
-- Add semantic search  
-- Improve moderation system  
+* No secrets committed to repository
+* Uses environment variables for sensitive data
+* Database and raw data excluded via `.gitignore`
+* Designed for safe public sharing
 
 ---
 
-## 💡 Tech Stack
+## 🧠 Future Improvements
 
-- Python  
-- FastAPI  
-- SQLite  
-- OpenAI API  
-- Expo Push  
-- Requests  
+* Vector DB integration (FAISS / Pinecone)
+* Caching layer for frequent queries
+* Fine-tuned prompts per intent
+* Multi-language support
+* Real-time analytics / observability
 
 ---
 
-## 📌 Summary
+## 👨‍💻 Author
 
-A production-style backend combining:
+**Eyal Berda**
 
-- AI chat  
-- Community features  
-- Content delivery  
-- Real-time tracking  
+Full Stack Developer | AI Systems Builder
+Specializing in:
 
-Designed as a foundation for a scalable postpartum support product.
+* .NET / React / Microservices
+* AI integrations (LLM + RAG)
+* Scalable backend architectures
+
+---
+
+## ⭐ Final Note
+
+This project demonstrates not just usage of AI —
+but **how to engineer AI systems correctly**:
+
+* grounded
+* explainable
+* production-ready
+
